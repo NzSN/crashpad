@@ -49,3 +49,4 @@
 /third_party/zlib/zlib
 /xcodebuild
 tags
+/.agent-shell/
