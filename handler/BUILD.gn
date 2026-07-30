@@ -142,6 +142,7 @@ source_set("handler_test") {
 
   deps = [
     ":handler",
+    "v8_heap:v8_heap_capture_test",
     "../client",
     "../compat",
     "../snapshot",

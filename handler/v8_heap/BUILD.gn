@@ -1,0 +1,53 @@
+# Copyright 2026 The Crashpad Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import("../../build/crashpad_buildconfig.gni")
+
+# Collects a minimal V8 heap snapshot (V8HE user minidump stream) for JIT frame
+# resolution from stack-only dumps. Linked into the handler via the
+# UserStreamDataSources vector registered in run_as_crashpad_handler_win.cc.
+source_set("v8_heap_capture") {
+  sources = [
+    "v8_heap_capture.cc",
+    "v8_heap_capture.h",
+    "v8_heap_format.h",
+    "v8_heap_user_stream_data_source.cc",
+    "v8_heap_user_stream_data_source.h",
+  ]
+
+  public_configs = [ "../..:crashpad_config" ]
+
+  public_deps = [
+    "..:common",
+    "../../minidump",
+    "../../snapshot",
+    "../../third_party/mini_chromium:base",
+  ]
+}
+
+source_set("v8_heap_capture_test") {
+  testonly = true
+
+  sources = [ "v8_heap_user_stream_data_source_unittest.cc" ]
+
+  public_configs = [ "../..:crashpad_config" ]
+
+  deps = [
+    ":v8_heap_capture",
+    "../../snapshot:test_support",
+    "../../test",
+    "../../third_party/googletest",
+    "../../third_party/mini_chromium:base",
+  ]
+}
