@@ -18,6 +18,7 @@
 #include "base/strings/utf_string_conversions.h"
 #include "build/build_config.h"
 #include "gtest/gtest.h"
+#include "partition_alloc/buildflags.h"
 #include "test/test_paths.h"
 #include "util/file/file_io.h"
 
@@ -48,7 +49,22 @@ class TestMultiprocessExec final : public MultiprocessExec {
   }
 };
 
-TEST(MultiprocessExec, MultiprocessExec) {
+// This fails under macOS 12; https://crbug.com/1341377
+//
+// TODO(tasak): enable this test after making address randomization not to
+// keep /dev/urandom open.
+// PartitionAllocator opens /dev/urandom because of address randomization.
+// (c.f. //base/rand_util_posix.cc and
+// //base/allocator/partition_allocator/src/partition_alloc/random.cc) So when
+// making PartitionAllocator default, multiprocess_exec_test_child will crash
+// because of LOG(FATAL) << "close". https://crbug.com/1153544
+#if defined(OS_POSIX) && PA_BUILDFLAG(USE_PARTITION_ALLOC_AS_MALLOC) || \
+    defined(OS_MAC)
+#define MAYBE_MultiprocessExec DISABLED_MultiprocessExec
+#else
+#define MAYBE_MultiprocessExec MultiprocessExec
+#endif
+TEST(MultiprocessExec, MAYBE_MultiprocessExec) {
   TestMultiprocessExec multiprocess_exec;
   base::FilePath child_test_executable = TestPaths::BuildArtifact(
       FILE_PATH_LITERAL("test"),

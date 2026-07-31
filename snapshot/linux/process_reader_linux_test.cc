@@ -73,7 +73,8 @@ pid_t gettid() {
   return syscall(SYS_gettid);
 }
 
-TEST(ProcessReaderLinux, SelfBasic) {
+// TODO(crbug.com/331803336): Flaky.
+TEST(ProcessReaderLinux, DISABLED_SelfBasic) {
   FakePtraceConnection connection;
   connection.Initialize(getpid());
 

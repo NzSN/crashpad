@@ -16,6 +16,8 @@
 
 #include <windows.h>
 
+#include <ostream>
+
 #include "base/check.h"
 #include "base/memory/page_size.h"
 
