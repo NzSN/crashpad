@@ -94,8 +94,9 @@ class V8HeapCapture {
                                            uint64_t off);
 
   // True if |va| looks like a heap object: its map field (compressed at +0) is
-  // a tagged pointer whose target is in RO space.
-  bool IsValidHeapObject(uint64_t va) const;
+  // a tagged pointer whose target's instance type is readable. Captures the
+  // map's page if needed (V8 Map objects live in old/map space, not RO).
+  bool IsValidHeapObject(const ProcessMemory& memory, uint64_t va);
 
   // In-memory reads from already-captured regions_. Return nullopt if |va|
   // is not wholly contained in a captured region.

@@ -183,15 +183,34 @@ void V8HeapCapture::CaptureRange(const ProcessMemory& memory,
                                  uint64_t size) {
   if (size == 0)
     return;
+  // Read in 4 KiB sub-chunks and coalesce contiguous readable chunks into a
+  // single region. A committed region may be smaller than a V8 page (RO space
+  // is observed as a 64 KiB read-only region), so a full 256 KiB page read
+  // would overshoot into unmapped space and fail — dropping RO entirely.
+  // Coalescing keeps each committed span as one contiguous region (the decoder
+  // reads Maps from RO and scans the isolate as one region for EPT discovery).
+  constexpr uint64_t kSubChunk = 4 * 1024;
+  const uint64_t start = va & ~(kSubChunk - 1);
   const uint64_t end = va + size;
-  for (uint64_t cur = AlignDownToPage(va); cur < end; cur += kV8PageSize) {
-    if (regions_.size() >= kMaxRegions)
-      break;
-    std::vector<uint8_t> buf(kV8PageSize);
-    if (!memory.Read(cur, kV8PageSize, buf.data()))
-      continue;  // unreadable tail of the span — skip
-    regions_.emplace(cur, Region{std::move(buf)});
+  uint64_t run_start = 0;
+  std::vector<uint8_t> run;
+  for (uint64_t a = start; a < end; a += kSubChunk) {
+    std::vector<uint8_t> buf(kSubChunk);
+    if (memory.Read(a, kSubChunk, buf.data())) {
+      if (run.empty())
+        run_start = a;
+      run.insert(run.end(), buf.begin(), buf.end());
+    } else {
+      if (!run.empty()) {
+        AddPage(run_start, std::move(run));
+        run.clear();
+        if (regions_.size() >= kMaxRegions)
+          break;
+      }
+    }
   }
+  if (!run.empty())
+    AddPage(run_start, std::move(run));
 }
 
 void V8HeapCapture::ChaseFromStacks(const ProcessSnapshot& snapshot,
@@ -213,7 +232,7 @@ void V8HeapCapture::ChaseFromStacks(const ProcessSnapshot& snapshot,
       if (!IsCageHeapPointer(w))
         continue;
       const uint64_t jsf = w & ~1ULL;
-      if (!CaptureObjectPage(memory, jsf) || !IsValidHeapObject(jsf))
+      if (!CaptureObjectPage(memory, jsf) || !IsValidHeapObject(memory, jsf))
         continue;
 
       // JSFunction -> SharedFunctionInfo.
@@ -257,19 +276,24 @@ std::optional<uint64_t> V8HeapCapture::FollowCompressed(
   if (!c || (*c & 1) == 0)
     return std::nullopt;  // Smi/null
   const uint64_t target = cage_base_ + static_cast<uint64_t>(*c & ~1u);
-  if (!CaptureObjectPage(memory, target) || !IsValidHeapObject(target))
+  if (!CaptureObjectPage(memory, target) || !IsValidHeapObject(memory, target))
     return std::nullopt;
   return target;
 }
 
-bool V8HeapCapture::IsValidHeapObject(uint64_t va) const {
-  // A heap object's map field (compressed at +0) is a tagged pointer whose
-  // target lives in RO space. RO begins at the cage base, so the map's cage
-  // offset must fall within the captured RO span.
+bool V8HeapCapture::IsValidHeapObject(const ProcessMemory& memory,
+                                      uint64_t va) {
+  // A heap object's map field (compressed at +0) is a tagged pointer. V8 Map
+  // objects live in old/map space, NOT RO space, so the map can be at any cage
+  // offset — do NOT assume it is within the RO span. Capture the map's page
+  // (the decoder reads the instance type at map+8) and validate by reading it.
   const auto map_c = ReadRegionsU32(va + v8_layout::kMapFieldOffset);
   if (!map_c || (*map_c & 1) == 0)
     return false;
-  return static_cast<uint64_t>(*map_c & ~1u) < kRoSpaceCaptureSpan;
+  const uint64_t map = cage_base_ + static_cast<uint64_t>(*map_c & ~1u);
+  if (!ReadRegionsU16(map + v8_layout::kMapInstanceTypeOffset))
+    CaptureObjectPage(memory, map);
+  return ReadRegionsU16(map + v8_layout::kMapInstanceTypeOffset).has_value();
 }
 
 const uint8_t* V8HeapCapture::ReadRegions(uint64_t va, size_t len) const {
