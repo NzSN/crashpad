@@ -382,7 +382,16 @@ TEST(MinidumpFileWriter, InitializeFromSnapshot_Basic) {
   const MINIDUMP_DIRECTORY* directory;
   const MINIDUMP_HEADER* header =
       MinidumpHeaderAtStart(string_file.string(), &directory);
+#if BUILDFLAG(IS_WIN)
+  // On Windows, extra memory is carried by a Memory64ListStream, the
+  // MemoryListStream is omitted (dbgeng rejects full-memory minidumps that
+  // also carry a MemoryListStream), and the minidump is marked as a
+  // full-memory dump.
+  ASSERT_NO_FATAL_FAILURE(VerifyMinidumpHeader(
+      header, 5, kSnapshotTime, MiniDumpWithFullMemory));
+#else
   ASSERT_NO_FATAL_FAILURE(VerifyMinidumpHeader(header, 5, kSnapshotTime));
+#endif
   ASSERT_TRUE(directory);
 
   EXPECT_EQ(directory[0].StreamType, kMinidumpStreamTypeSystemInfo);
@@ -401,6 +410,23 @@ TEST(MinidumpFileWriter, InitializeFromSnapshot_Basic) {
   EXPECT_TRUE(MinidumpWritableAtLocationDescriptor<MINIDUMP_MODULE_LIST>(
                   string_file.string(), directory[3].Location));
 
+#if BUILDFLAG(IS_WIN)
+  EXPECT_EQ(directory[4].StreamType, kMinidumpStreamTypeMemory64List);
+  const MINIDUMP_MEMORY64_LIST* memory64_list =
+      MinidumpWritableAtLocationDescriptor<MINIDUMP_MEMORY64_LIST>(
+          string_file.string(), directory[4].Location);
+  ASSERT_TRUE(memory64_list);
+  ASSERT_EQ(memory64_list->NumberOfMemoryRanges, 1u);
+  EXPECT_EQ(memory64_list->MemoryRanges[0].StartOfMemoryRange, kPebAddress);
+  EXPECT_EQ(memory64_list->MemoryRanges[0].DataSize, kPebSize);
+
+  // The memory range contents follow the descriptor array, at BaseRva.
+  ASSERT_GE(string_file.string().size(),
+            memory64_list->BaseRva + kPebSize);
+  EXPECT_EQ(
+      string_file.string().substr(memory64_list->BaseRva, kPebSize),
+      std::string(kPebSize, 'p'));
+#else
   EXPECT_EQ(directory[4].StreamType, kMinidumpStreamTypeMemoryList);
   EXPECT_TRUE(MinidumpWritableAtLocationDescriptor<MINIDUMP_MEMORY_LIST>(
                   string_file.string(), directory[4].Location));
@@ -411,6 +437,7 @@ TEST(MinidumpFileWriter, InitializeFromSnapshot_Basic) {
   EXPECT_EQ(memory_list->NumberOfMemoryRanges, 1u);
   EXPECT_EQ(memory_list->MemoryRanges[0].StartOfMemoryRange, kPebAddress);
   EXPECT_EQ(memory_list->MemoryRanges[0].Memory.DataSize, kPebSize);
+#endif
 }
 
 TEST(MinidumpFileWriter, InitializeFromSnapshot_Exception) {

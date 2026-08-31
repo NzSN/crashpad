@@ -69,7 +69,12 @@ class MinidumpFileWriter final : public internal::MinidumpWritable {
   //!  - kMinidumpStreamTypeMemoryInfoList (if present)
   //!  - kMinidumpStreamTypeHandleData (if present)
   //!  - User streams (if present)
-  //!  - kMinidumpStreamTypeMemoryList
+  //!  - kMinidumpStreamTypeMemoryList (omitted on Windows when the process
+  //!    snapshot carries extra memory, because dbgeng rejects full-memory
+  //!    minidumps that also carry a MemoryListStream)
+  //!  - kMinidumpStreamTypeMemory64List (on Windows only, when the process
+  //!    snapshot carries extra memory; the minidump is then marked
+  //!    MiniDumpWithFullMemory)
   //!
   //! \param[in] process_snapshot The process snapshot to use as source data.
   //!

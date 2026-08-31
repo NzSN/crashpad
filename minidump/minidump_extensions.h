@@ -62,6 +62,11 @@ enum MinidumpStreamType : uint32_t {
   //! \sa MemoryListStream
   kMinidumpStreamTypeMemoryList = MemoryListStream,
 
+  //! \brief The stream type for MINIDUMP_MEMORY64_LIST.
+  //!
+  //! \sa Memory64ListStream
+  kMinidumpStreamTypeMemory64List = Memory64ListStream,
+
   //! \brief The stream type for MINIDUMP_EXCEPTION_STREAM.
   //!
   //! \sa ExceptionStream

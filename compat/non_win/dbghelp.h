@@ -175,6 +175,9 @@ enum MINIDUMP_STREAM_TYPE {
   //! \brief The stream type for MINIDUMP_SYSTEM_INFO.
   SystemInfoStream = 7,
 
+  //! \brief The stream type for MINIDUMP_MEMORY64_LIST.
+  Memory64ListStream = 9,
+
   //! \brief The stream contains information about active `HANDLE`s.
   HandleDataStream = 12,
 
@@ -651,6 +654,40 @@ struct __attribute__((packed, aligned(4))) MINIDUMP_MEMORY_LIST {
   //! \brief Structures identifying each memory region present in the minidump
   //!     file.
   MINIDUMP_MEMORY_DESCRIPTOR MemoryRanges[0];
+};
+
+//! \brief A pointer to a snapshot of a region of memory contained within a
+//!     minidump file, used in a MINIDUMP_MEMORY64_LIST.
+//!
+//! Unlike MINIDUMP_MEMORY_DESCRIPTOR, this structure carries no location
+//! information for the memory region’s contents. Instead, the contents of all
+//! memory regions in a MINIDUMP_MEMORY64_LIST are stored contiguously, in
+//! #MemoryRanges order, beginning at MINIDUMP_MEMORY64_LIST::BaseRva.
+struct __attribute__((packed, aligned(4))) MINIDUMP_MEMORY_DESCRIPTOR64 {
+  //! \brief The base address of the memory region in the address space of the
+  //!     process that the minidump file contains a snapshot of.
+  uint64_t StartOfMemoryRange;
+
+  //! \brief The size of the memory region, in bytes.
+  uint64_t DataSize;
+};
+
+//! \brief Information about memory regions within the process, used for
+//!     full-memory minidump files.
+//!
+//! The memory region contents are stored contiguously, in #MemoryRanges order,
+//! beginning at #BaseRva.
+struct __attribute__((packed, aligned(4))) MINIDUMP_MEMORY64_LIST {
+  //! \brief The number of memory regions present in the #MemoryRanges array.
+  uint64_t NumberOfMemoryRanges;
+
+  //! \brief The 64-bit relative virtual address of the beginning of the memory
+  //!     region contents within the minidump file.
+  RVA64 BaseRva;
+
+  //! \brief Structures identifying each memory region present in the minidump
+  //!     file.
+  MINIDUMP_MEMORY_DESCRIPTOR64 MemoryRanges[0];
 };
 
 //! \brief Contains the state of an individual system handle at the time the

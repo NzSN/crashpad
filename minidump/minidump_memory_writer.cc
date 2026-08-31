@@ -309,4 +309,184 @@ void MinidumpMemoryListWriter::DropRangesThatOverlapNonOwned() {
   std::swap(children_, non_overlapping);
 }
 
+MinidumpMemory64DataWriter::MinidumpMemory64DataWriter(
+    const MemorySnapshot* memory_snapshot)
+    : internal::MinidumpWritable(),
+      MemorySnapshot::Delegate(),
+      memory_snapshot_(memory_snapshot),
+      file_writer_(nullptr) {}
+
+MinidumpMemory64DataWriter::~MinidumpMemory64DataWriter() {}
+
+bool MinidumpMemory64DataWriter::MemorySnapshotDelegateRead(void* data,
+                                                            size_t size) {
+  DCHECK_EQ(state(), kStateWritable);
+  DCHECK_EQ(size, UnderlyingSnapshot()->Size());
+  return file_writer_->Write(data, size);
+}
+
+bool MinidumpMemory64DataWriter::WriteObject(
+    FileWriterInterface* file_writer) {
+  DCHECK_EQ(state(), kStateWritable);
+  DCHECK(!file_writer_);
+
+  base::AutoReset<FileWriterInterface*> file_writer_reset(&file_writer_,
+                                                          file_writer);
+
+  // This will result in MemorySnapshotDelegateRead() being called.
+  if (!memory_snapshot_->Read(this)) {
+    // If the Read() fails (perhaps because the process' memory map has changed
+    // since it the range was captured), write an empty block of memory. The
+    // full number of bytes must be written regardless, because the data for
+    // each memory range in a MINIDUMP_MEMORY64_LIST is located implicitly, by
+    // accumulating the sizes of the preceding memory ranges. See
+    // https://crashpad.chromium.org/234 for background.
+    std::vector<uint8_t> empty(memory_snapshot_->Size(), 0xfe);
+    MemorySnapshotDelegateRead(empty.data(), empty.size());
+  }
+
+  return true;
+}
+
+size_t MinidumpMemory64DataWriter::SizeOfObject() {
+  DCHECK_GE(state(), kStateFrozen);
+
+  return UnderlyingSnapshot()->Size();
+}
+
+size_t MinidumpMemory64DataWriter::Alignment() {
+  DCHECK_GE(state(), kStateFrozen);
+
+  // The data for each memory range in a MINIDUMP_MEMORY64_LIST is located
+  // implicitly, by accumulating the sizes of the preceding memory ranges
+  // beginning at MINIDUMP_MEMORY64_LIST::BaseRva. No padding may be inserted
+  // between consecutive memory ranges.
+  return 1;
+}
+
+internal::MinidumpWritable::Phase MinidumpMemory64DataWriter::WritePhase() {
+  // Memory dumps are large and are unlikely to be consumed in their entirety.
+  // Data accesses are expected to be sparse and sporadic, and are expected to
+  // occur after all of the other structural and informational data from the
+  // minidump file has been read. Put memory dumps at the end of the minidump
+  // file to improve spatial locality.
+  return kPhaseLate;
+}
+
+MinidumpMemory64ListWriter::MinidumpMemory64ListWriter()
+    : MinidumpStreamWriter(),
+      children_(),
+      memory64_descriptors_(),
+      memory64_list_base_() {}
+
+MinidumpMemory64ListWriter::~MinidumpMemory64ListWriter() {
+}
+
+void MinidumpMemory64ListWriter::AddFromSnapshot(
+    const std::vector<const MemorySnapshot*>& memory_snapshots) {
+  DCHECK_EQ(state(), kStateMutable);
+
+  for (const MemorySnapshot* memory_snapshot : memory_snapshots) {
+    std::unique_ptr<MinidumpMemory64DataWriter> memory(
+        new MinidumpMemory64DataWriter(memory_snapshot));
+    AddMemory(std::move(memory));
+  }
+}
+
+void MinidumpMemory64ListWriter::AddMemory(
+    std::unique_ptr<MinidumpMemory64DataWriter> memory_writer) {
+  DCHECK_EQ(state(), kStateMutable);
+
+  if (memory_writer->UnderlyingSnapshot()->Size() == 0) {
+    return;
+  }
+
+  children_.push_back(std::move(memory_writer));
+}
+
+bool MinidumpMemory64ListWriter::Freeze() {
+  DCHECK_EQ(state(), kStateMutable);
+
+  if (!MinidumpStreamWriter::Freeze()) {
+    return false;
+  }
+
+  memory64_descriptors_.clear();
+  memory64_descriptors_.reserve(children_.size());
+  for (const auto& child : children_) {
+    const MemorySnapshot* snapshot = child->UnderlyingSnapshot();
+    MINIDUMP_MEMORY_DESCRIPTOR64 descriptor = {};
+    descriptor.StartOfMemoryRange = snapshot->Address();
+    descriptor.DataSize = snapshot->Size();
+    memory64_descriptors_.push_back(descriptor);
+  }
+
+  memory64_list_base_.NumberOfMemoryRanges = memory64_descriptors_.size();
+
+  return true;
+}
+
+size_t MinidumpMemory64ListWriter::SizeOfObject() {
+  DCHECK_GE(state(), kStateFrozen);
+
+  return sizeof(memory64_list_base_) +
+         memory64_descriptors_.size() * sizeof(MINIDUMP_MEMORY_DESCRIPTOR64);
+}
+
+std::vector<internal::MinidumpWritable*> MinidumpMemory64ListWriter::Children() {
+  DCHECK_GE(state(), kStateFrozen);
+
+  std::vector<MinidumpWritable*> children;
+  children.reserve(children_.size());
+  for (const auto& child : children_) {
+    children.push_back(child.get());
+  }
+
+  return children;
+}
+
+bool MinidumpMemory64ListWriter::WillWriteAtOffsetImpl(FileOffset offset) {
+  DCHECK_EQ(state(), kStateFrozen);
+
+  // The memory data begins immediately after the MINIDUMP_MEMORY_DESCRIPTOR64
+  // array. The child MinidumpMemory64DataWriter objects are placed
+  // consecutively at this offset, in descriptor order, with no intervening
+  // padding. See MinidumpMemory64DataWriter::Alignment().
+  memory64_list_base_.BaseRva = offset + SizeOfObject();
+
+  return MinidumpWritable::WillWriteAtOffsetImpl(offset);
+}
+
+bool MinidumpMemory64ListWriter::WriteObject(FileWriterInterface* file_writer) {
+  DCHECK_EQ(state(), kStateWritable);
+
+  WritableIoVec iov;
+  iov.iov_base = &memory64_list_base_;
+  iov.iov_len = sizeof(memory64_list_base_);
+  std::vector<WritableIoVec> iovecs(1, iov);
+
+  if (!memory64_descriptors_.empty()) {
+    iov.iov_base = memory64_descriptors_.data();
+    iov.iov_len =
+        memory64_descriptors_.size() * sizeof(MINIDUMP_MEMORY_DESCRIPTOR64);
+    iovecs.push_back(iov);
+  }
+
+  return file_writer->WriteIoVec(&iovecs);
+}
+
+size_t MinidumpMemory64ListWriter::Alignment() {
+  DCHECK_GE(state(), kStateFrozen);
+
+  return 16;
+}
+
+internal::MinidumpWritable::Phase MinidumpMemory64ListWriter::WritePhase() {
+  return kPhaseLate;
+}
+
+MinidumpStreamType MinidumpMemory64ListWriter::StreamType() const {
+  return kMinidumpStreamTypeMemory64List;
+}
+
 }  // namespace crashpad

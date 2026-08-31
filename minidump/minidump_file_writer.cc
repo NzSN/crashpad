@@ -171,10 +171,27 @@ void MinidumpFileWriter::InitializeFromSnapshot(
     DCHECK(add_stream_result);
   }
 
+#if BUILDFLAG(IS_WIN)
+  // ProcessSnapshotWin captures the contents of every committed, readable
+  // region of the process into ExtraMemory(). Write these regions as a
+  // Memory64ListStream, leaving the MemoryListStream to carry thread stacks.
+  // A Memory64ListStream is required for debuggers to accept the dump as a
+  // full-memory minidump: dbgeng refuses to open a dump whose header carries
+  // MiniDumpWithFullMemory without a Memory64ListStream.
+  auto memory64_list = std::make_unique<MinidumpMemory64ListWriter>();
+  memory64_list->AddFromSnapshot(process_snapshot->ExtraMemory());
+  for (const ThreadSnapshot* thread_snapshot : process_snapshot->Threads()) {
+    memory64_list->AddFromSnapshot(thread_snapshot->ExtraMemory());
+  }
+  if (exception_snapshot) {
+    memory64_list->AddFromSnapshot(exception_snapshot->ExtraMemory());
+  }
+#else
   memory_list->AddFromSnapshot(process_snapshot->ExtraMemory());
   if (exception_snapshot) {
     memory_list->AddFromSnapshot(exception_snapshot->ExtraMemory());
   }
+#endif  // BUILDFLAG(IS_WIN)
 
   // These user streams must be added last. Otherwise, a user stream with the
   // same type as a well-known stream could preempt the well-known stream. As it
@@ -184,7 +201,8 @@ void MinidumpFileWriter::InitializeFromSnapshot(
   // stream that would preempt the memory list stream.
   for (const auto& module : process_snapshot->Modules()) {
     for (const UserMinidumpStream* stream : module->CustomMinidumpStreams()) {
-      if (stream->stream_type() == kMinidumpStreamTypeMemoryList) {
+      if (stream->stream_type() == kMinidumpStreamTypeMemoryList ||
+          stream->stream_type() == kMinidumpStreamTypeMemory64List) {
         LOG(WARNING) << "discarding duplicate stream of type "
                      << stream->stream_type();
         continue;
@@ -201,8 +219,28 @@ void MinidumpFileWriter::InitializeFromSnapshot(
   // will not have to ride at the end of the file. Thread stack memory, for
   // example, exists as a children of threads, and appears alongside them in the
   // file, despite also being mentioned by the memory list stream.
+#if BUILDFLAG(IS_WIN)
+  if (!memory64_list->empty()) {
+    // The memory64 list stream carries the full process memory contents
+    // captured into ExtraMemory() by ProcessSnapshotWin, making this a
+    // full-memory minidump. dbgeng requires such dumps to carry a
+    // Memory64ListStream and refuses ones that also carry a MemoryListStream,
+    // so the memory list is omitted. Thread stack descriptors in the
+    // ThreadListStream remain valid (their data is written alongside the
+    // threads), and the same address ranges are also present in the
+    // Memory64ListStream.
+    header_.Flags = header_.Flags | MiniDumpWithFullMemory;
+
+    add_stream_result = AddStream(std::move(memory64_list));
+    DCHECK(add_stream_result);
+  } else {
+    add_stream_result = AddStream(std::move(memory_list));
+    DCHECK(add_stream_result);
+  }
+#else
   add_stream_result = AddStream(std::move(memory_list));
   DCHECK(add_stream_result);
+#endif  // BUILDFLAG(IS_WIN)
 }
 
 void MinidumpFileWriter::SetTimestamp(time_t timestamp) {

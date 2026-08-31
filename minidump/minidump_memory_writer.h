@@ -205,6 +205,151 @@ class MinidumpMemoryListWriter final : public internal::MinidumpStreamWriter {
   MINIDUMP_MEMORY_LIST memory_list_base_;
 };
 
+//! \brief Writes the data for a single memory range referenced by a
+//!     MINIDUMP_MEMORY64_LIST stream.
+//!
+//! Unlike SnapshotMinidumpMemoryWriter, this class does not maintain a
+//! MINIDUMP_MEMORY_DESCRIPTOR, because MINIDUMP_MEMORY_DESCRIPTOR64 objects
+//! carry no location information: the data for all memory ranges in a
+//! MINIDUMP_MEMORY64_LIST is stored contiguously, in descriptor order,
+//! beginning at MINIDUMP_MEMORY64_LIST::BaseRva. To preserve this tight
+//! packing, objects of this class request 1-byte alignment so that no padding
+//! is inserted between consecutive memory ranges.
+class MinidumpMemory64DataWriter final : public internal::MinidumpWritable,
+                                         public MemorySnapshot::Delegate {
+ public:
+  explicit MinidumpMemory64DataWriter(const MemorySnapshot* memory_snapshot);
+
+  MinidumpMemory64DataWriter(const MinidumpMemory64DataWriter&) = delete;
+  MinidumpMemory64DataWriter& operator=(const MinidumpMemory64DataWriter&) =
+      delete;
+
+  ~MinidumpMemory64DataWriter() override;
+
+ private:
+  friend class MinidumpMemory64ListWriter;
+
+  // MemorySnapshot::Delegate:
+  bool MemorySnapshotDelegateRead(void* data, size_t size) override;
+
+  // MinidumpWritable:
+  size_t SizeOfObject() override;
+  bool WriteObject(FileWriterInterface* file_writer) override;
+
+  //! \brief Returns the object’s desired byte-boundary alignment.
+  //!
+  //! The memory data in a MINIDUMP_MEMORY64_LIST must be packed tightly, in
+  //! descriptor order, so no alignment padding may be inserted between
+  //! consecutive memory ranges.
+  //!
+  //! \return `1`.
+  //!
+  //! \note Valid in #kStateFrozen or any subsequent state.
+  size_t Alignment() override;
+
+  //! \brief Returns the object’s desired write phase.
+  //!
+  //! Memory regions are written at the end of minidump files, because it is
+  //! expected that unlike most other data in a minidump file, the contents of
+  //! memory regions will be accessed sparsely.
+  //!
+  //! \return #kPhaseLate.
+  //!
+  //! \note Valid in any state.
+  Phase WritePhase() override;
+
+  //! \brief Gets the underlying memory snapshot that the memory writer will
+  //!     write to the minidump.
+  const MemorySnapshot* UnderlyingSnapshot() const { return memory_snapshot_; }
+
+  const MemorySnapshot* memory_snapshot_;
+  FileWriterInterface* file_writer_;
+};
+
+//! \brief The writer for a MINIDUMP_MEMORY64_LIST stream in a minidump file,
+//!     containing a list of MINIDUMP_MEMORY_DESCRIPTOR64 objects, followed by
+//!     the memory data for each memory range.
+//!
+//! Unlike MinidumpMemoryListWriter, the memory data is written as part of this
+//! stream (by child MinidumpMemory64DataWriter objects), packed tightly in
+//! descriptor order beginning at MINIDUMP_MEMORY64_LIST::BaseRva, as required
+//! by the Memory64ListStream format. A minidump file whose MINIDUMP_HEADER
+//! Flags field contains MiniDumpWithFullMemory must carry a stream of this
+//! type.
+class MinidumpMemory64ListWriter final : public internal::MinidumpStreamWriter {
+ public:
+  MinidumpMemory64ListWriter();
+
+  MinidumpMemory64ListWriter(const MinidumpMemory64ListWriter&) = delete;
+  MinidumpMemory64ListWriter& operator=(const MinidumpMemory64ListWriter&) =
+      delete;
+
+  ~MinidumpMemory64ListWriter() override;
+
+  //! \brief Adds a MinidumpMemory64DataWriter for each memory snapshot in \a
+  //!     memory_snapshots to the MINIDUMP_MEMORY64_LIST.
+  //!
+  //! Memory snapshots are added in the fashion of AddMemory().
+  //!
+  //! \param[in] memory_snapshots The memory snapshots to use as source data.
+  //!
+  //! \note Valid in #kStateMutable.
+  void AddFromSnapshot(
+      const std::vector<const MemorySnapshot*>& memory_snapshots);
+
+  //! \brief Adds a MinidumpMemory64DataWriter to the MINIDUMP_MEMORY64_LIST.
+  //!
+  //! This object takes ownership of \a memory_writer and becomes its parent in
+  //! the overall tree of internal::MinidumpWritable objects.
+  //!
+  //! \note Valid in #kStateMutable.
+  void AddMemory(std::unique_ptr<MinidumpMemory64DataWriter> memory_writer);
+
+  //! \brief Returns whether no memory ranges have been added to this object.
+  //!
+  //! \note Valid in any state.
+  bool empty() const { return children_.empty(); }
+
+ protected:
+  // MinidumpWritable:
+  bool Freeze() override;
+  size_t SizeOfObject() override;
+  std::vector<MinidumpWritable*> Children() override;
+  bool WillWriteAtOffsetImpl(FileOffset offset) override;
+  bool WriteObject(FileWriterInterface* file_writer) override;
+
+  //! \brief Returns the object’s desired byte-boundary alignment.
+  //!
+  //! The MINIDUMP_MEMORY64_LIST stream is aligned to a 16-byte boundary, so
+  //! that MINIDUMP_MEMORY64_LIST::BaseRva (which immediately follows the
+  //! MINIDUMP_MEMORY_DESCRIPTOR64 array, whose elements are each 16 bytes long)
+  //! is 16-byte aligned as well.
+  //!
+  //! \return `16`.
+  //!
+  //! \note Valid in #kStateFrozen or any subsequent state.
+  size_t Alignment() override;
+
+  //! \brief Returns the object’s desired write phase.
+  //!
+  //! The memory data written by this object’s children is large and is
+  //! expected to be accessed sparsely, so the entire stream is written at the
+  //! end of the minidump file.
+  //!
+  //! \return #kPhaseLate.
+  //!
+  //! \note Valid in any state.
+  Phase WritePhase() override;
+
+  // MinidumpStreamWriter:
+  MinidumpStreamType StreamType() const override;
+
+ private:
+  std::vector<std::unique_ptr<MinidumpMemory64DataWriter>> children_;
+  std::vector<MINIDUMP_MEMORY_DESCRIPTOR64> memory64_descriptors_;
+  MINIDUMP_MEMORY64_LIST memory64_list_base_;
+};
+
 }  // namespace crashpad
 
 #endif  // CRASHPAD_MINIDUMP_MINIDUMP_MEMORY_WRITER_H_

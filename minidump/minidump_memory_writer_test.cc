@@ -687,6 +687,148 @@ TEST(MinidumpMemoryWriter, CoalescePairsVariousCases) {
   // clang-format on
 }
 
+// expected_streams is the expected number of streams in the file. The memory64
+// list must be the last stream in the directory. If there is another stream,
+// it must come first, have stream type kBogusStreamType, and have zero-length
+// data.
+void GetMemory64ListStream(const std::string& file_contents,
+                           const MINIDUMP_MEMORY64_LIST** memory64_list,
+                           const uint32_t expected_streams,
+                           const MINIDUMP_DIRECTORY** stream_directory) {
+  const MINIDUMP_DIRECTORY* directory;
+  const MINIDUMP_HEADER* header =
+      MinidumpHeaderAtStart(file_contents, &directory);
+  ASSERT_NO_FATAL_FAILURE(VerifyMinidumpHeader(header, expected_streams, 0));
+  ASSERT_TRUE(directory);
+
+  size_t directory_index = 0;
+  if (expected_streams > 1) {
+    ASSERT_EQ(directory[directory_index].StreamType, kBogusStreamType);
+    ASSERT_EQ(directory[directory_index].Location.DataSize, 0u);
+    ++directory_index;
+  }
+
+  ASSERT_EQ(directory[directory_index].StreamType,
+            kMinidumpStreamTypeMemory64List);
+
+  *memory64_list = MinidumpWritableAtLocationDescriptor<MINIDUMP_MEMORY64_LIST>(
+      file_contents, directory[directory_index].Location);
+  ASSERT_TRUE(*memory64_list);
+
+  if (stream_directory) {
+    *stream_directory = &directory[directory_index];
+  }
+}
+
+TEST(MinidumpMemory64Writer, EmptyMemory64List) {
+  MinidumpFileWriter minidump_file_writer;
+  auto memory64_list_writer = std::make_unique<MinidumpMemory64ListWriter>();
+
+  ASSERT_TRUE(minidump_file_writer.AddStream(std::move(memory64_list_writer)));
+
+  StringFile string_file;
+  ASSERT_TRUE(minidump_file_writer.WriteEverything(&string_file));
+
+  const MINIDUMP_MEMORY64_LIST* memory64_list = nullptr;
+  ASSERT_NO_FATAL_FAILURE(
+      GetMemory64ListStream(string_file.string(), &memory64_list, 1, nullptr));
+
+  EXPECT_EQ(memory64_list->NumberOfMemoryRanges, 0u);
+}
+
+TEST(MinidumpMemory64Writer, TwoMemory64Regions) {
+  MinidumpFileWriter minidump_file_writer;
+  auto memory64_list_writer = std::make_unique<MinidumpMemory64ListWriter>();
+
+  // Use odd sizes to verify that the memory data is packed tightly, with no
+  // alignment padding inserted between consecutive memory ranges, and use an
+  // address above 4GB for one region to verify 64-bit addressing.
+  constexpr uint64_t kBaseAddress0 = 0xc0ffee;
+  constexpr size_t kSize0 = 0x101;
+  constexpr char kValue0 = '6';
+  constexpr uint64_t kBaseAddress1 = 0x1fac00fac;
+  constexpr size_t kSize1 = 0x203;
+  constexpr char kValue1 = '!';
+
+  TestMemorySnapshot snapshot0;
+  snapshot0.SetAddress(kBaseAddress0);
+  snapshot0.SetSize(kSize0);
+  snapshot0.SetValue(kValue0);
+
+  TestMemorySnapshot snapshot1;
+  snapshot1.SetAddress(kBaseAddress1);
+  snapshot1.SetSize(kSize1);
+  snapshot1.SetValue(kValue1);
+
+  memory64_list_writer->AddFromSnapshot({&snapshot0, &snapshot1});
+
+  ASSERT_TRUE(minidump_file_writer.AddStream(std::move(memory64_list_writer)));
+
+  StringFile string_file;
+  ASSERT_TRUE(minidump_file_writer.WriteEverything(&string_file));
+
+  const std::string& file_contents = string_file.string();
+
+  const MINIDUMP_MEMORY64_LIST* memory64_list = nullptr;
+  const MINIDUMP_DIRECTORY* stream_directory = nullptr;
+  ASSERT_NO_FATAL_FAILURE(GetMemory64ListStream(
+      file_contents, &memory64_list, 1, &stream_directory));
+
+  ASSERT_EQ(memory64_list->NumberOfMemoryRanges, 2u);
+
+  size_t stream_rva = stream_directory->Location.Rva;
+  EXPECT_EQ(memory64_list->BaseRva,
+            stream_rva + sizeof(MINIDUMP_MEMORY64_LIST) +
+                2 * sizeof(MINIDUMP_MEMORY_DESCRIPTOR64));
+
+  EXPECT_EQ(memory64_list->MemoryRanges[0].StartOfMemoryRange, kBaseAddress0);
+  EXPECT_EQ(memory64_list->MemoryRanges[0].DataSize, kSize0);
+  EXPECT_EQ(memory64_list->MemoryRanges[1].StartOfMemoryRange, kBaseAddress1);
+  EXPECT_EQ(memory64_list->MemoryRanges[1].DataSize, kSize1);
+
+  // The memory data must be packed tightly, in descriptor order, beginning at
+  // BaseRva.
+  RVA64 data_rva = memory64_list->BaseRva;
+  ASSERT_GE(file_contents.size(), data_rva + kSize0 + kSize1);
+  EXPECT_EQ(file_contents.substr(data_rva, kSize0), std::string(kSize0, kValue0));
+  EXPECT_EQ(file_contents.substr(data_rva + kSize0, kSize1),
+            std::string(kSize1, kValue1));
+}
+
+TEST(MinidumpMemory64Writer, ZeroSizeRegionSkipped) {
+  MinidumpFileWriter minidump_file_writer;
+  auto memory64_list_writer = std::make_unique<MinidumpMemory64ListWriter>();
+
+  constexpr uint64_t kBaseAddress = 0xfedcba9876543210;
+  constexpr size_t kSize = 0x1000;
+  constexpr char kValue = 'm';
+
+  TestMemorySnapshot snapshot_zero;
+  snapshot_zero.SetAddress(0x1000);
+  snapshot_zero.SetSize(0);
+  snapshot_zero.SetValue('z');
+
+  TestMemorySnapshot snapshot;
+  snapshot.SetAddress(kBaseAddress);
+  snapshot.SetSize(kSize);
+  snapshot.SetValue(kValue);
+
+  memory64_list_writer->AddFromSnapshot({&snapshot_zero, &snapshot});
+
+  ASSERT_TRUE(minidump_file_writer.AddStream(std::move(memory64_list_writer)));
+
+  StringFile string_file;
+  ASSERT_TRUE(minidump_file_writer.WriteEverything(&string_file));
+
+  const MINIDUMP_MEMORY64_LIST* memory64_list = nullptr;
+  ASSERT_NO_FATAL_FAILURE(
+      GetMemory64ListStream(string_file.string(), &memory64_list, 1, nullptr));
+
+  ASSERT_EQ(memory64_list->NumberOfMemoryRanges, 1u);
+  EXPECT_EQ(memory64_list->MemoryRanges[0].StartOfMemoryRange, kBaseAddress);
+  EXPECT_EQ(memory64_list->MemoryRanges[0].DataSize, kSize);
+}
+
 }  // namespace
 }  // namespace test
 }  // namespace crashpad
