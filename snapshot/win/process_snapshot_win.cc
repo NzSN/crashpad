@@ -108,6 +108,21 @@ bool ProcessSnapshotWin::Initialize(
        process_reader_.GetProcessInfo().MemoryInfo()) {
     memory_map_.push_back(
         std::make_unique<internal::MemoryMapRegionSnapshotWin>(mbi));
+
+    // Capture the full contents of every committed, readable region of the
+    // process so that the resulting minidump is a full memory dump. This is
+    // the same accessibility predicate as RegionIsAccessible() in
+    // util/win/process_info.cc.
+    if (mbi.State == MEM_COMMIT && (mbi.Protect & PAGE_NOACCESS) == 0 &&
+        (mbi.Protect & PAGE_GUARD) == 0) {
+      auto memory_snapshot =
+          std::make_unique<internal::MemorySnapshotGeneric>();
+      memory_snapshot->Initialize(
+          process_reader_.Memory(),
+          static_cast<WinVMAddress>(mbi.BaseAddress),
+          static_cast<WinVMSize>(mbi.RegionSize));
+      extra_memory_.push_back(std::move(memory_snapshot));
+    }
   }
 
   for (const auto& module : modules_) {
