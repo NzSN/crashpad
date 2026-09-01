@@ -13,6 +13,7 @@
 #include "util/ios/raw_logging.h"
 #include "util/mach/mach_extensions.h"
 #include "util/mach/mach_message.h"
+#include "util/mach/exc_client_variants.h"
 #include "util/mach/mach_message_server.h"
 #include "util/posix/signals.h"
 
@@ -150,13 +151,17 @@ bool CrashHandler::InstallMachExceptionHandler() {
       ~(EXC_MASK_EMULATION | EXC_MASK_SOFTWARE | EXC_MASK_RPC_ALERT |
         EXC_MASK_GUARD | (IsBeingDebugged() ? EXC_MASK_BREAKPOINT : 0));
 
+  exception_behavior_t behavior = EXCEPTION_STATE_IDENTITY;
+  if (__builtin_available(iOS 18.0, *)) {
+    behavior = EXCEPTION_STATE_IDENTITY_PROTECTED;
+  }
+
   ExceptionPorts exception_ports(ExceptionPorts::kTargetTypeTask, TASK_NULL);
   if (!exception_ports.GetExceptionPorts(mask, &original_handlers_) ||
-      !exception_ports.SetExceptionPort(
-          mask,
-          exception_port,
-          EXCEPTION_STATE_IDENTITY | MACH_EXCEPTION_CODES,
-          MACHINE_THREAD_STATE)) {
+      !exception_ports.SetExceptionPort(mask,
+                                        exception_port,
+                                        behavior | MACH_EXCEPTION_CODES,
+                                        MACHINE_THREAD_STATE)) {
     return false;
   }
 
@@ -219,9 +224,6 @@ kern_return_t CrashHandler::CatchMachException(
     bool* destroy_complex_request) {
   *destroy_complex_request = true;
 
-  // TODO(justincohen): Forward exceptions to original_handlers_ with
-  // UniversalExceptionRaise.
-
   // iOS shouldn't have any child processes, but just in case, those will
   // inherit the task exception ports, and this process isn’t prepared to
   // handle them
@@ -238,6 +240,27 @@ kern_return_t CrashHandler::CatchMachException(
                       *flavor,
                       old_state,
                       old_state_count);
+
+  for (const auto& handler : original_handlers_) {
+    if (handler.mask & (1 << exception)) {
+      kern_return_t kr = UniversalExceptionRaise(handler.behavior,
+                                                 handler.port,
+                                                 thread,
+                                                 task,
+                                                 exception,
+                                                 code,
+                                                 code_count,
+                                                 flavor,
+                                                 old_state,
+                                                 old_state_count,
+                                                 new_state,
+                                                 new_state_count);
+      if (kr == KERN_SUCCESS) {
+        return KERN_SUCCESS;
+      }
+      break;
+    }
+  }
 
   // Respond with KERN_FAILURE so the system will continue to handle this
   // exception. xnu will turn this Mach exception into a signal and take the
