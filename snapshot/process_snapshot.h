@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "snapshot/handle_snapshot.h"
+#include "snapshot/memory_capture_mode.h"
 #include "util/misc/uuid.h"
 #include "util/process/process_id.h"
 
@@ -49,6 +50,11 @@ class UnloadedModuleSnapshot;
 class ProcessSnapshot {
  public:
   virtual ~ProcessSnapshot() {}
+
+  //! \brief Returns the memory capture policy used to create this snapshot.
+  virtual MemoryCaptureMode GetMemoryCaptureMode() const {
+    return MemoryCaptureMode::kPartial;
+  }
 
   //! \brief Returns the snapshot process’ process ID.
   virtual crashpad::ProcessID ProcessID() const = 0;

@@ -264,6 +264,7 @@ class MinidumpMemory64DataWriter final : public internal::MinidumpWritable,
 
   const MemorySnapshot* memory_snapshot_;
   FileWriterInterface* file_writer_;
+  bool write_failed_ = false;
 };
 
 //! \brief The writer for a MINIDUMP_MEMORY64_LIST stream in a minidump file,

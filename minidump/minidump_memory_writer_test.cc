@@ -240,14 +240,10 @@ class TestMemoryStream final : public internal::MinidumpStreamWriter {
 
   ~TestMemoryStream() override {}
 
-  TestMinidumpMemoryWriter* memory() {
-    return &memory_;
-  }
+  TestMinidumpMemoryWriter* memory() { return &memory_; }
 
   // MinidumpStreamWriter:
-  MinidumpStreamType StreamType() const override {
-    return kBogusStreamType;
-  }
+  MinidumpStreamType StreamType() const override { return kBogusStreamType; }
 
  protected:
   // MinidumpWritable:
@@ -438,8 +434,8 @@ TEST(MinidumpMemoryWriter, CoalesceExplicitMultiple) {
       {11000, 1000, 0xf4},
 
       // Large base addresses.
-      { 0xfedcba9876543210, 1024, 0x88 },
-      { 0x1111111111111111, 1024, 0x99 },
+      {0xfedcba9876543210, 1024, 0x88},
+      {0x1111111111111111, 1024, 0x99},
   };
 
   std::vector<std::unique_ptr<TestMemorySnapshot>> memory_snapshots_owner;
@@ -760,7 +756,9 @@ TEST(MinidumpMemory64Writer, TwoMemory64Regions) {
   snapshot1.SetSize(kSize1);
   snapshot1.SetValue(kValue1);
 
-  memory64_list_writer->AddFromSnapshot({&snapshot0, &snapshot1});
+  // Deliberately reverse input order. Descriptors and payloads must both be
+  // serialized in address order for debugger lookups.
+  memory64_list_writer->AddFromSnapshot({&snapshot1, &snapshot0});
 
   ASSERT_TRUE(minidump_file_writer.AddStream(std::move(memory64_list_writer)));
 
@@ -790,9 +788,57 @@ TEST(MinidumpMemory64Writer, TwoMemory64Regions) {
   // BaseRva.
   RVA64 data_rva = memory64_list->BaseRva;
   ASSERT_GE(file_contents.size(), data_rva + kSize0 + kSize1);
-  EXPECT_EQ(file_contents.substr(data_rva, kSize0), std::string(kSize0, kValue0));
+  EXPECT_EQ(file_contents.substr(data_rva, kSize0),
+            std::string(kSize0, kValue0));
   EXPECT_EQ(file_contents.substr(data_rva + kSize0, kSize1),
             std::string(kSize1, kValue1));
+}
+
+class FailedPayloadFile : public StringFile {
+ public:
+  bool Write(const void* data, size_t size) override {
+    if (size == 513 || size == 64 * 1024) {
+      ++payload_attempts;
+      return false;
+    }
+    return StringFile::Write(data, size);
+  }
+  size_t payload_attempts = 0;
+};
+
+TEST(MinidumpMemory64Writer, ReadFailureAndOutputFailure) {
+  for (bool source_failure : {false, true}) {
+    TestMemorySnapshot readable;
+    TestMemorySnapshot unreadable;
+    unreadable.SetShouldFailRead(true);
+    TestMemorySnapshot* snapshot = source_failure ? &unreadable : &readable;
+    snapshot->SetAddress(0x10000);
+    snapshot->SetSize(source_failure ? 65539 : 513);
+    snapshot->SetValue('x');
+    {
+      MinidumpFileWriter writer;
+      auto list = std::make_unique<MinidumpMemory64ListWriter>();
+      list->AddFromSnapshot({snapshot});
+      ASSERT_TRUE(writer.AddStream(std::move(list)));
+      FailedPayloadFile file;
+      EXPECT_FALSE(writer.WriteEverything(&file));
+      EXPECT_EQ(file.payload_attempts, 1u);
+    }
+    if (source_failure) {
+      MinidumpFileWriter writer;
+      auto list = std::make_unique<MinidumpMemory64ListWriter>();
+      list->AddFromSnapshot({snapshot});
+      ASSERT_TRUE(writer.AddStream(std::move(list)));
+      StringFile file;
+      ASSERT_TRUE(writer.WriteEverything(&file));
+      const MINIDUMP_MEMORY64_LIST* memory = nullptr;
+      ASSERT_NO_FATAL_FAILURE(
+          GetMemory64ListStream(file.string(), &memory, 1, nullptr));
+      ASSERT_TRUE(memory);
+      EXPECT_EQ(file.string().substr(memory->BaseRva),
+                std::string(65539, static_cast<char>(0xfe)));
+    }
+  }
 }
 
 TEST(MinidumpMemory64Writer, ZeroSizeRegionSkipped) {

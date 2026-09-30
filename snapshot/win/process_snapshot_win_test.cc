@@ -17,6 +17,7 @@
 #include "base/files/file_path.h"
 #include "build/build_config.h"
 #include "gtest/gtest.h"
+#include "snapshot/memory_snapshot.h"
 #include "snapshot/win/pe_image_reader.h"
 #include "snapshot/win/process_reader_win.h"
 #include "test/errors.h"
@@ -30,6 +31,42 @@
 namespace crashpad {
 namespace test {
 namespace {
+
+TEST(ProcessSnapshotWin, MemoryCaptureModes) {
+  SYSTEM_INFO info;
+  GetSystemInfo(&info);
+  const size_t page = info.dwPageSize;
+  void* allocation =
+      VirtualAlloc(nullptr, page * 4, MEM_RESERVE, PAGE_NOACCESS);
+  ASSERT_NE(allocation, nullptr);
+  auto release = [](void* address) { VirtualFree(address, 0, MEM_RELEASE); };
+  std::unique_ptr<void, decltype(release)> owned(allocation, release);
+  ASSERT_EQ(VirtualAlloc(allocation, page * 3, MEM_COMMIT, PAGE_READWRITE),
+            allocation);
+  DWORD old_protect;
+  auto* bytes = static_cast<uint8_t*>(allocation);
+  ASSERT_TRUE(VirtualProtect(bytes + page, page, PAGE_NOACCESS, &old_protect));
+  ASSERT_TRUE(VirtualProtect(
+      bytes + page * 2, page, PAGE_READWRITE | PAGE_GUARD, &old_protect));
+  const uint64_t base = reinterpret_cast<uintptr_t>(allocation);
+  for (MemoryCaptureMode mode :
+       {MemoryCaptureMode::kPartial, MemoryCaptureMode::kFullMemory}) {
+    ProcessSnapshotWin snapshot;
+    ASSERT_TRUE(snapshot.Initialize(
+        GetCurrentProcess(), ProcessSuspensionState::kRunning, 0, 0, mode));
+    EXPECT_EQ(snapshot.GetMemoryCaptureMode(), mode);
+    bool captured = false;
+    for (const MemorySnapshot* memory : snapshot.ExtraMemory()) {
+      if (memory->Address() >= base && memory->Address() < base + page * 4) {
+        EXPECT_EQ(mode, MemoryCaptureMode::kFullMemory);
+        EXPECT_EQ(memory->Address(), base);
+        EXPECT_EQ(memory->Size(), page);
+        captured = true;
+      }
+    }
+    EXPECT_EQ(captured, mode == MemoryCaptureMode::kFullMemory);
+  }
+}
 
 void TestImageReaderChild(const TestPaths::Architecture architecture) {
   UUID done_uuid;

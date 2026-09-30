@@ -55,8 +55,7 @@ MinidumpFileWriter::MinidumpFileWriter()
   header_.Flags = MiniDumpNormal;
 }
 
-MinidumpFileWriter::~MinidumpFileWriter() {
-}
+MinidumpFileWriter::~MinidumpFileWriter() {}
 
 void MinidumpFileWriter::InitializeFromSnapshot(
     const ProcessSnapshot* process_snapshot) {
@@ -172,26 +171,30 @@ void MinidumpFileWriter::InitializeFromSnapshot(
   }
 
 #if BUILDFLAG(IS_WIN)
-  // ProcessSnapshotWin captures the contents of every committed, readable
-  // region of the process into ExtraMemory(). Write these regions as a
-  // Memory64ListStream, leaving the MemoryListStream to carry thread stacks.
-  // A Memory64ListStream is required for debuggers to accept the dump as a
-  // full-memory minidump: dbgeng refuses to open a dump whose header carries
-  // MiniDumpWithFullMemory without a Memory64ListStream.
-  auto memory64_list = std::make_unique<MinidumpMemory64ListWriter>();
-  memory64_list->AddFromSnapshot(process_snapshot->ExtraMemory());
-  for (const ThreadSnapshot* thread_snapshot : process_snapshot->Threads()) {
-    memory64_list->AddFromSnapshot(thread_snapshot->ExtraMemory());
-  }
-  if (exception_snapshot) {
-    memory64_list->AddFromSnapshot(exception_snapshot->ExtraMemory());
-  }
+  const bool full_memory = process_snapshot->GetMemoryCaptureMode() ==
+                           MemoryCaptureMode::kFullMemory;
 #else
-  memory_list->AddFromSnapshot(process_snapshot->ExtraMemory());
-  if (exception_snapshot) {
-    memory_list->AddFromSnapshot(exception_snapshot->ExtraMemory());
-  }
+  const bool full_memory = false;
+#endif
+#if BUILDFLAG(IS_WIN)
+  std::unique_ptr<MinidumpMemory64ListWriter> memory64_list;
+  if (full_memory) {
+    memory64_list = std::make_unique<MinidumpMemory64ListWriter>();
+    memory64_list->AddFromSnapshot(process_snapshot->ExtraMemory());
+    for (const ThreadSnapshot* thread_snapshot : process_snapshot->Threads()) {
+      memory64_list->AddFromSnapshot(thread_snapshot->ExtraMemory());
+    }
+    if (exception_snapshot) {
+      memory64_list->AddFromSnapshot(exception_snapshot->ExtraMemory());
+    }
+  } else
 #endif  // BUILDFLAG(IS_WIN)
+  {
+    memory_list->AddFromSnapshot(process_snapshot->ExtraMemory());
+    if (exception_snapshot) {
+      memory_list->AddFromSnapshot(exception_snapshot->ExtraMemory());
+    }
+  }
 
   // These user streams must be added last. Otherwise, a user stream with the
   // same type as a well-known stream could preempt the well-known stream. As it
@@ -202,7 +205,8 @@ void MinidumpFileWriter::InitializeFromSnapshot(
   for (const auto& module : process_snapshot->Modules()) {
     for (const UserMinidumpStream* stream : module->CustomMinidumpStreams()) {
       if (stream->stream_type() == kMinidumpStreamTypeMemoryList ||
-          stream->stream_type() == kMinidumpStreamTypeMemory64List) {
+          (full_memory &&
+           stream->stream_type() == kMinidumpStreamTypeMemory64List)) {
         LOG(WARNING) << "discarding duplicate stream of type "
                      << stream->stream_type();
         continue;
@@ -220,7 +224,7 @@ void MinidumpFileWriter::InitializeFromSnapshot(
   // example, exists as a children of threads, and appears alongside them in the
   // file, despite also being mentioned by the memory list stream.
 #if BUILDFLAG(IS_WIN)
-  if (!memory64_list->empty()) {
+  if (full_memory) {
     // The memory64 list stream carries the full process memory contents
     // captured into ExtraMemory() by ProcessSnapshotWin, making this a
     // full-memory minidump. dbgeng requires such dumps to carry a

@@ -15,10 +15,10 @@
 #ifndef CRASHPAD_SNAPSHOT_WIN_PROCESS_SNAPSHOT_WIN_H_
 #define CRASHPAD_SNAPSHOT_WIN_PROCESS_SNAPSHOT_WIN_H_
 
-#include <windows.h>
 #include <stdint.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <windows.h>
 
 #include <map>
 #include <memory>
@@ -73,14 +73,19 @@ class ProcessSnapshotWin final : public ProcessSnapshot {
   //!     `.DebugInfo`. Used as a starting point to walk the process's locks.
   //!     May be `0`.
   //!
+  //! \param[in] memory_capture_mode Whether to capture standard selected ranges
+  //!     or all eligible committed process regions. Defaults to partial.
+  //!
   //! \return `true` if the snapshot could be created, `false` otherwise with
   //!     an appropriate message logged.
   //!
   //! \sa ScopedProcessSuspend
-  bool Initialize(HANDLE process,
-                  ProcessSuspensionState suspension_state,
-                  WinVMAddress exception_information_address,
-                  WinVMAddress debug_critical_section_address);
+  bool Initialize(
+      HANDLE process,
+      ProcessSuspensionState suspension_state,
+      WinVMAddress exception_information_address,
+      WinVMAddress debug_critical_section_address,
+      MemoryCaptureMode memory_capture_mode = MemoryCaptureMode::kPartial);
 
   //! \brief Sets the value to be returned by ReportID().
   //!
@@ -134,8 +139,10 @@ class ProcessSnapshotWin final : public ProcessSnapshot {
   std::vector<HandleSnapshot> Handles() const override;
   std::vector<const MemorySnapshot*> ExtraMemory() const override;
   const ProcessMemory* Memory() const override;
+  MemoryCaptureMode GetMemoryCaptureMode() const override;
 
  private:
+  MemoryCaptureMode memory_capture_mode_ = MemoryCaptureMode::kPartial;
   // Initializes threads_ on behalf of Initialize().
   void InitializeThreads(uint32_t* indirectly_referenced_memory_cap);
 

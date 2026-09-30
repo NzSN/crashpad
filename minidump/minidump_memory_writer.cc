@@ -21,6 +21,7 @@
 #include "base/auto_reset.h"
 #include "base/check_op.h"
 #include "base/logging.h"
+#include "base/numerics/safe_math.h"
 #include "util/file/file_writer.h"
 #include "util/numeric/safe_assignment.h"
 
@@ -120,7 +121,7 @@ bool SnapshotMinidumpMemoryWriter::WillWriteAtOffsetImpl(FileOffset offset) {
   }
 
   for (MINIDUMP_MEMORY_DESCRIPTOR* memory_descriptor :
-           registered_memory_descriptors_) {
+       registered_memory_descriptors_) {
     memory_descriptor->StartOfMemoryRange = local_address;
   }
 
@@ -144,8 +145,7 @@ MinidumpMemoryListWriter::MinidumpMemoryListWriter()
       all_memory_writers_(),
       memory_list_base_() {}
 
-MinidumpMemoryListWriter::~MinidumpMemoryListWriter() {
-}
+MinidumpMemoryListWriter::~MinidumpMemoryListWriter() {}
 
 void MinidumpMemoryListWriter::AddFromSnapshot(
     const std::vector<const MemorySnapshot*>& memory_snapshots) {
@@ -322,29 +322,38 @@ bool MinidumpMemory64DataWriter::MemorySnapshotDelegateRead(void* data,
                                                             size_t size) {
   DCHECK_EQ(state(), kStateWritable);
   DCHECK_EQ(size, UnderlyingSnapshot()->Size());
-  return file_writer_->Write(data, size);
+  const bool success = file_writer_->Write(data, size);
+  write_failed_ |= !success;
+  return success;
 }
 
-bool MinidumpMemory64DataWriter::WriteObject(
-    FileWriterInterface* file_writer) {
+bool MinidumpMemory64DataWriter::WriteObject(FileWriterInterface* file_writer) {
   DCHECK_EQ(state(), kStateWritable);
   DCHECK(!file_writer_);
 
   base::AutoReset<FileWriterInterface*> file_writer_reset(&file_writer_,
                                                           file_writer);
 
-  // This will result in MemorySnapshotDelegateRead() being called.
-  if (!memory_snapshot_->Read(this)) {
-    // If the Read() fails (perhaps because the process' memory map has changed
-    // since it the range was captured), write an empty block of memory. The
-    // full number of bytes must be written regardless, because the data for
-    // each memory range in a MINIDUMP_MEMORY64_LIST is located implicitly, by
-    // accumulating the sizes of the preceding memory ranges. See
-    // https://crashpad.chromium.org/234 for background.
-    std::vector<uint8_t> empty(memory_snapshot_->Size(), 0xfe);
-    MemorySnapshotDelegateRead(empty.data(), empty.size());
+  if (memory_snapshot_->Read(this)) {
+    return !write_failed_;
+  }
+  if (write_failed_) {
+    return false;
   }
 
+  // A source read failure must preserve descriptor offsets. Bound the
+  // placeholder allocation independently of the region size.
+  LOG(WARNING) << "Full-memory read failed at " << memory_snapshot_->Address();
+  constexpr size_t kFillChunkSize = 64 * 1024;
+  std::vector<uint8_t> fill(kFillChunkSize, 0xfe);
+  size_t remaining = memory_snapshot_->Size();
+  while (remaining != 0) {
+    const size_t size = std::min(remaining, fill.size());
+    if (!file_writer->Write(fill.data(), size)) {
+      return false;
+    }
+    remaining -= size;
+  }
   return true;
 }
 
@@ -379,8 +388,7 @@ MinidumpMemory64ListWriter::MinidumpMemory64ListWriter()
       memory64_descriptors_(),
       memory64_list_base_() {}
 
-MinidumpMemory64ListWriter::~MinidumpMemory64ListWriter() {
-}
+MinidumpMemory64ListWriter::~MinidumpMemory64ListWriter() {}
 
 void MinidumpMemory64ListWriter::AddFromSnapshot(
     const std::vector<const MemorySnapshot*>& memory_snapshots) {
@@ -411,6 +419,37 @@ bool MinidumpMemory64ListWriter::Freeze() {
     return false;
   }
 
+  base::CheckedNumeric<size_t> stream_size = sizeof(memory64_list_base_);
+  stream_size += base::CheckedNumeric<size_t>(children_.size()) *
+                 sizeof(MINIDUMP_MEMORY_DESCRIPTOR64);
+  base::CheckedNumeric<FileOffset> payload_size = 0;
+  for (const auto& child : children_) {
+    const MemorySnapshot* snapshot = child->UnderlyingSnapshot();
+    const base::CheckedNumeric<uint64_t> end =
+        base::CheckedNumeric<uint64_t>(snapshot->Address()) + snapshot->Size();
+    payload_size += snapshot->Size();
+    if (!end.IsValid() || !payload_size.IsValid()) {
+      LOG(ERROR) << "Full-memory range overflow";
+      return false;
+    }
+  }
+  if (!stream_size.IsValid()) {
+    return false;
+  }
+
+  // dbgeng performs address-based lookups in this stream. Snapshot producers
+  // append metadata and whole-process ranges in different orders, so sort the
+  // descriptors and their corresponding payload writers together.
+  std::stable_sort(
+      children_.begin(), children_.end(), [](const auto& a, const auto& b) {
+        const MemorySnapshot* left = a->UnderlyingSnapshot();
+        const MemorySnapshot* right = b->UnderlyingSnapshot();
+        if (left->Address() != right->Address()) {
+          return left->Address() < right->Address();
+        }
+        return left->Size() < right->Size();
+      });
+
   memory64_descriptors_.clear();
   memory64_descriptors_.reserve(children_.size());
   for (const auto& child : children_) {
@@ -433,7 +472,8 @@ size_t MinidumpMemory64ListWriter::SizeOfObject() {
          memory64_descriptors_.size() * sizeof(MINIDUMP_MEMORY_DESCRIPTOR64);
 }
 
-std::vector<internal::MinidumpWritable*> MinidumpMemory64ListWriter::Children() {
+std::vector<internal::MinidumpWritable*>
+MinidumpMemory64ListWriter::Children() {
   DCHECK_GE(state(), kStateFrozen);
 
   std::vector<MinidumpWritable*> children;
@@ -452,7 +492,18 @@ bool MinidumpMemory64ListWriter::WillWriteAtOffsetImpl(FileOffset offset) {
   // array. The child MinidumpMemory64DataWriter objects are placed
   // consecutively at this offset, in descriptor order, with no intervening
   // padding. See MinidumpMemory64DataWriter::Alignment().
-  memory64_list_base_.BaseRva = offset + SizeOfObject();
+  base::CheckedNumeric<FileOffset> end = offset;
+  end += SizeOfObject();
+  if (!end.IsValid()) {
+    return false;
+  }
+  memory64_list_base_.BaseRva = end.ValueOrDie<RVA64>();
+  for (const auto& child : children_) {
+    end += child->UnderlyingSnapshot()->Size();
+    if (!end.IsValid()) {
+      return false;
+    }
+  }
 
   return MinidumpWritable::WillWriteAtOffsetImpl(offset);
 }

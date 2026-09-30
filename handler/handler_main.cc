@@ -46,6 +46,7 @@
 #include "client/simple_string_dictionary.h"
 #include "handler/crash_report_upload_thread.h"
 #include "handler/prune_crash_reports_thread.h"
+#include "snapshot/memory_capture_mode.h"
 #include "tools/tool_support.h"
 #include "util/file/file_io.h"
 #include "util/misc/address_types.h"
@@ -105,6 +106,7 @@ void Usage(const base::FilePath& me) {
 "Usage: %" PRFilePath " [OPTION]...\n"
 "Crashpad's exception handler server.\n"
 "\n"
+"      --dump-mode=MODE        partial (default) or full (Windows only)\n"
 "      --annotation=KEY=VALUE  set a process annotation in each crash report\n"
   // clang-format on
 #if defined(ATTACHMENTS_SUPPORTED)
@@ -220,6 +222,7 @@ void Usage(const base::FilePath& me) {
 }
 
 struct Options {
+  MemoryCaptureMode memory_capture_mode = MemoryCaptureMode::kPartial;
   std::map<std::string, std::string> annotations;
   std::map<std::string, std::string> monitor_self_annotations;
   std::string url;
@@ -334,12 +337,10 @@ void HandleCrashSignal(int sig, siginfo_t* siginfo, void* context) {
   // (acknowledged by the standard) is for negative numbers to indicate that a
   // signal was generated asynchronously. Although xnu does not do this, allow
   // for the possibility for completeness.
-  bool si_code_valid = !(siginfo->si_code <= 0 ||
-                         siginfo->si_code == SI_USER ||
-                         siginfo->si_code == SI_QUEUE ||
-                         siginfo->si_code == SI_TIMER ||
-                         siginfo->si_code == SI_ASYNCIO ||
-                         siginfo->si_code == SI_MESGQ);
+  bool si_code_valid =
+      !(siginfo->si_code <= 0 || siginfo->si_code == SI_USER ||
+        siginfo->si_code == SI_QUEUE || siginfo->si_code == SI_TIMER ||
+        siginfo->si_code == SI_ASYNCIO || siginfo->si_code == SI_MESGQ);
 
   // 0x5343 = 'SC', signifying “signal and code”, disambiguates from the schema
   // used by ExceptionCodeForMetrics(). That system primarily uses Mach
@@ -383,9 +384,7 @@ void InstallCrashHandler() {
 #if BUILDFLAG(IS_APPLE)
 
 struct ResetSIGTERMTraits {
-  static struct sigaction* InvalidValue() {
-    return nullptr;
-  }
+  static struct sigaction* InvalidValue() { return nullptr; }
 
   static void Free(struct sigaction* sa) {
     int rv = sigaction(SIGTERM, sa, nullptr);
@@ -580,6 +579,7 @@ int HandlerMain(int argc,
   enum OptionFlags {
     // Long options without short equivalents.
     kOptionLastChar = 255,
+    kOptionDumpMode,
     kOptionAnnotation,
 #if defined(ATTACHMENTS_SUPPORTED)
     kOptionAttachment,
@@ -636,92 +636,99 @@ int HandlerMain(int argc,
   };
 
   static constexpr option long_options[] = {
-    {"annotation", required_argument, nullptr, kOptionAnnotation},
+      {"dump-mode", required_argument, nullptr, kOptionDumpMode},
+      {"annotation", required_argument, nullptr, kOptionAnnotation},
 #if defined(ATTACHMENTS_SUPPORTED)
-    {"attachment", required_argument, nullptr, kOptionAttachment},
+      {"attachment", required_argument, nullptr, kOptionAttachment},
 #endif  // ATTACHMENTS_SUPPORTED
-    {"database", required_argument, nullptr, kOptionDatabase},
+      {"database", required_argument, nullptr, kOptionDatabase},
 #if BUILDFLAG(IS_APPLE)
-    {"handshake-fd", required_argument, nullptr, kOptionHandshakeFD},
+      {"handshake-fd", required_argument, nullptr, kOptionHandshakeFD},
 #endif  // BUILDFLAG(IS_APPLE)
 #if BUILDFLAG(IS_WIN)
-    {"initial-client-data",
-     required_argument,
-     nullptr,
-     kOptionInitialClientData},
+      {"initial-client-data",
+       required_argument,
+       nullptr,
+       kOptionInitialClientData},
 #endif  // BUILDFLAG(IS_APPLE)
 #if BUILDFLAG(IS_ANDROID) || BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
-    {"initial-client-fd", required_argument, nullptr, kOptionInitialClientFD},
+      {"initial-client-fd", required_argument, nullptr, kOptionInitialClientFD},
 #endif  // BUILDFLAG(IS_ANDROID) || BUILDFLAG(IS_LINUX) ||
         // BUILDFLAG(IS_CHROMEOS)
 #if BUILDFLAG(IS_APPLE)
-    {"mach-service", required_argument, nullptr, kOptionMachService},
+      {"mach-service", required_argument, nullptr, kOptionMachService},
 #endif  // BUILDFLAG(IS_APPLE)
-    {"metrics-dir", required_argument, nullptr, kOptionMetrics},
-    {"monitor-self", no_argument, nullptr, kOptionMonitorSelf},
-    {"monitor-self-annotation",
-     required_argument,
-     nullptr,
-     kOptionMonitorSelfAnnotation},
-    {"monitor-self-argument",
-     required_argument,
-     nullptr,
-     kOptionMonitorSelfArgument},
-    {"no-identify-client-via-url",
-     no_argument,
-     nullptr,
-     kOptionNoIdentifyClientViaUrl},
-    {"no-periodic-tasks", no_argument, nullptr, kOptionNoPeriodicTasks},
-    {"no-rate-limit", no_argument, nullptr, kOptionNoRateLimit},
-    {"no-upload-gzip", no_argument, nullptr, kOptionNoUploadGzip},
+      {"metrics-dir", required_argument, nullptr, kOptionMetrics},
+      {"monitor-self", no_argument, nullptr, kOptionMonitorSelf},
+      {"monitor-self-annotation",
+       required_argument,
+       nullptr,
+       kOptionMonitorSelfAnnotation},
+      {"monitor-self-argument",
+       required_argument,
+       nullptr,
+       kOptionMonitorSelfArgument},
+      {"no-identify-client-via-url",
+       no_argument,
+       nullptr,
+       kOptionNoIdentifyClientViaUrl},
+      {"no-periodic-tasks", no_argument, nullptr, kOptionNoPeriodicTasks},
+      {"no-rate-limit", no_argument, nullptr, kOptionNoRateLimit},
+      {"no-upload-gzip", no_argument, nullptr, kOptionNoUploadGzip},
 #if BUILDFLAG(IS_ANDROID)
-    {"no-write-minidump-to-database",
-     no_argument,
-     nullptr,
-     kOptionNoWriteMinidumpToDatabase},
+      {"no-write-minidump-to-database",
+       no_argument,
+       nullptr,
+       kOptionNoWriteMinidumpToDatabase},
 #endif  // BUILDFLAG(IS_ANDROID)
 #if BUILDFLAG(IS_WIN)
-    {"pipe-name", required_argument, nullptr, kOptionPipeName},
+      {"pipe-name", required_argument, nullptr, kOptionPipeName},
 #endif  // BUILDFLAG(IS_WIN)
 #if BUILDFLAG(IS_APPLE)
-    {"reset-own-crash-exception-port-to-system-default",
-     no_argument,
-     nullptr,
-     kOptionResetOwnCrashExceptionPortToSystemDefault},
+      {"reset-own-crash-exception-port-to-system-default",
+       no_argument,
+       nullptr,
+       kOptionResetOwnCrashExceptionPortToSystemDefault},
 #endif  // BUILDFLAG(IS_APPLE)
 #if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS) || BUILDFLAG(IS_ANDROID)
-    {"sanitization-information",
-     required_argument,
-     nullptr,
-     kOptionSanitizationInformation},
-    {"shared-client-connection",
-     no_argument,
-     nullptr,
-     kOptionSharedClientConnection},
-    {"trace-parent-with-exception",
-     required_argument,
-     nullptr,
-     kOptionTraceParentWithException},
+      {"sanitization-information",
+       required_argument,
+       nullptr,
+       kOptionSanitizationInformation},
+      {"shared-client-connection",
+       no_argument,
+       nullptr,
+       kOptionSharedClientConnection},
+      {"trace-parent-with-exception",
+       required_argument,
+       nullptr,
+       kOptionTraceParentWithException},
 #endif  // BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS) ||
         // BUILDFLAG(IS_ANDROID)
-    {"url", required_argument, nullptr, kOptionURL},
+      {"url", required_argument, nullptr, kOptionURL},
 #if BUILDFLAG(IS_CHROMEOS)
-    {"use-cros-crash-reporter",
-     no_argument,
-     nullptr,
-     kOptionUseCrosCrashReporter},
-    {"minidump-dir-for-tests",
-     required_argument,
-     nullptr,
-     kOptionMinidumpDirForTests},
-    {"always-allow-feedback", no_argument, nullptr, kOptionAlwaysAllowFeedback},
+      {"use-cros-crash-reporter",
+       no_argument,
+       nullptr,
+       kOptionUseCrosCrashReporter},
+      {"minidump-dir-for-tests",
+       required_argument,
+       nullptr,
+       kOptionMinidumpDirForTests},
+      {"always-allow-feedback",
+       no_argument,
+       nullptr,
+       kOptionAlwaysAllowFeedback},
 #endif  // BUILDFLAG(IS_CHROMEOS)
 #if BUILDFLAG(IS_ANDROID)
-    {"write-minidump-to-log", no_argument, nullptr, kOptionWriteMinidumpToLog},
+      {"write-minidump-to-log",
+       no_argument,
+       nullptr,
+       kOptionWriteMinidumpToLog},
 #endif  // BUILDFLAG(IS_ANDROID)
-    {"help", no_argument, nullptr, kOptionHelp},
-    {"version", no_argument, nullptr, kOptionVersion},
-    {nullptr, 0, nullptr, 0},
+      {"help", no_argument, nullptr, kOptionHelp},
+      {"version", no_argument, nullptr, kOptionVersion},
+      {nullptr, 0, nullptr, 0},
   };
 
   Options options = {};
@@ -739,9 +746,28 @@ int HandlerMain(int argc,
   options.write_minidump_to_database = true;
 #endif
 
+  bool dump_mode_seen = false;
   int opt;
   while ((opt = getopt_long(argc, argv, "", long_options, nullptr)) != -1) {
     switch (opt) {
+      case kOptionDumpMode: {
+        if (dump_mode_seen || (std::string(optarg) != "partial" &&
+                               std::string(optarg) != "full")) {
+          ToolSupport::UsageHint(me, "invalid or repeated --dump-mode");
+          return EXIT_FAILURE;
+        }
+        dump_mode_seen = true;
+        options.memory_capture_mode = std::string(optarg) == "full"
+                                          ? MemoryCaptureMode::kFullMemory
+                                          : MemoryCaptureMode::kPartial;
+#if !BUILDFLAG(IS_WIN)
+        if (options.memory_capture_mode == MemoryCaptureMode::kFullMemory) {
+          ToolSupport::UsageHint(me, "--dump-mode=full requires Windows");
+          return EXIT_FAILURE;
+        }
+#endif
+        break;
+      }
       case kOptionAnnotation: {
         if (!AddKeyValueToMap(&options.annotations, optarg, "--annotation")) {
           return ExitFailure();
@@ -778,8 +804,7 @@ int HandlerMain(int argc,
 #if BUILDFLAG(IS_WIN)
       case kOptionInitialClientData: {
         if (!options.initial_client_data.InitializeFromString(optarg)) {
-          ToolSupport::UsageHint(
-              me, "failed to parse --initial-client-data");
+          ToolSupport::UsageHint(me, "failed to parse --initial-client-data");
           return ExitFailure();
         }
         break;
@@ -1044,9 +1069,7 @@ int HandlerMain(int argc,
 #if BUILDFLAG(IS_CHROMEOS)
   if (options.use_cros_crash_reporter) {
     auto cros_handler = std::make_unique<CrosCrashReportExceptionHandler>(
-        database.get(),
-        &options.annotations,
-        user_stream_sources);
+        database.get(), &options.annotations, user_stream_sources);
 
     if (!options.minidump_dir_for_tests.empty()) {
       cros_handler->SetDumpDir(options.minidump_dir_for_tests);
@@ -1083,7 +1106,12 @@ int HandlerMain(int argc,
       true,
       false,
 #endif  // BUILDFLAG(IS_LINUX)
+#if BUILDFLAG(IS_WIN)
+      user_stream_sources,
+      options.memory_capture_mode);
+#else
       user_stream_sources);
+#endif  // BUILDFLAG(IS_WIN)
 #endif  // BUILDFLAG(IS_CHROMEOS)
 
 #if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS) || BUILDFLAG(IS_ANDROID)
@@ -1115,10 +1143,9 @@ int HandlerMain(int argc,
   base::apple::ScopedMachReceiveRight receive_right;
 
   if (options.handshake_fd >= 0) {
-    receive_right.reset(
-        ChildPortHandshake::RunServerForFD(
-            base::ScopedFD(options.handshake_fd),
-            ChildPortHandshake::PortRightType::kReceiveRight));
+    receive_right.reset(ChildPortHandshake::RunServerForFD(
+        base::ScopedFD(options.handshake_fd),
+        ChildPortHandshake::PortRightType::kReceiveRight));
   } else if (!options.mach_service.empty()) {
     receive_right = BootstrapCheckIn(options.mach_service);
   }

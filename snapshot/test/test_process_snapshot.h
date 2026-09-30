@@ -128,9 +128,7 @@ class TestProcessSnapshot final : public ProcessSnapshot {
   //! \brief Adds a handle snapshot to be returned by Handles().
   //!
   //! \param[in] handle The handle snapshot that will be included in Handles().
-  void AddHandle(const HandleSnapshot& handle) {
-    handles_.push_back(handle);
-  }
+  void AddHandle(const HandleSnapshot& handle) { handles_.push_back(handle); }
 
   //! \brief Add a memory snapshot to be returned by ExtraMemory().
   //!
@@ -170,6 +168,12 @@ class TestProcessSnapshot final : public ProcessSnapshot {
   std::vector<HandleSnapshot> Handles() const override;
   std::vector<const MemorySnapshot*> ExtraMemory() const override;
   const ProcessMemory* Memory() const override;
+  MemoryCaptureMode GetMemoryCaptureMode() const override {
+    return memory_capture_mode_;
+  }
+  void SetMemoryCaptureMode(MemoryCaptureMode mode) {
+    memory_capture_mode_ = mode;
+  }
 
  private:
   crashpad::ProcessID process_id_;
@@ -190,6 +194,7 @@ class TestProcessSnapshot final : public ProcessSnapshot {
   std::vector<HandleSnapshot> handles_;
   std::vector<std::unique_ptr<MemorySnapshot>> extra_memory_;
   std::unique_ptr<ProcessMemory> process_memory_;
+  MemoryCaptureMode memory_capture_mode_ = MemoryCaptureMode::kPartial;
 };
 
 }  // namespace test

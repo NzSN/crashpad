@@ -38,8 +38,10 @@ CrashReportExceptionHandler::CrashReportExceptionHandler(
     CrashReportUploadThread* upload_thread,
     const std::map<std::string, std::string>* process_annotations,
     const std::vector<base::FilePath>* attachments,
-    const UserStreamDataSources* user_stream_data_sources)
-    : database_(database),
+    const UserStreamDataSources* user_stream_data_sources,
+    MemoryCaptureMode memory_capture_mode)
+    : memory_capture_mode_(memory_capture_mode),
+      database_(database),
       upload_thread_(upload_thread),
       process_annotations_(process_annotations),
       attachments_(attachments),
@@ -61,7 +63,8 @@ unsigned int CrashReportExceptionHandler::ExceptionHandlerServerException(
   if (!process_snapshot.Initialize(process,
                                    ProcessSuspensionState::kSuspended,
                                    exception_information_address,
-                                   debug_critical_section_address)) {
+                                   debug_critical_section_address,
+                                   memory_capture_mode_)) {
     Metrics::ExceptionCaptureResult(Metrics::CaptureResult::kSnapshotFailed);
     return kTerminationCodeSnapshotFailed;
   }

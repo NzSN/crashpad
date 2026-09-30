@@ -21,6 +21,7 @@
 #include <string>
 
 #include "handler/user_stream_data_source.h"
+#include "snapshot/memory_capture_mode.h"
 #include "util/win/exception_handler_server.h"
 
 namespace crashpad {
@@ -55,12 +56,15 @@ class CrashReportExceptionHandler final
   //!     crash reports. For each crash report that is written, the data sources
   //!     are called in turn. These data sources may contribute additional
   //!     minidump streams. `nullptr` if not required.
+  //! \param[in] memory_capture_mode Immutable memory capture policy for
+  //! clients.
   CrashReportExceptionHandler(
       CrashReportDatabase* database,
       CrashReportUploadThread* upload_thread,
       const std::map<std::string, std::string>* process_annotations,
       const std::vector<base::FilePath>* attachments,
-      const UserStreamDataSources* user_stream_data_sources);
+      const UserStreamDataSources* user_stream_data_sources,
+      MemoryCaptureMode memory_capture_mode = MemoryCaptureMode::kPartial);
 
   CrashReportExceptionHandler(const CrashReportExceptionHandler&) = delete;
   CrashReportExceptionHandler& operator=(const CrashReportExceptionHandler&) =
@@ -79,6 +83,7 @@ class CrashReportExceptionHandler final
       WinVMAddress debug_critical_section_address) override;
 
  private:
+  const MemoryCaptureMode memory_capture_mode_;
   CrashReportDatabase* database_;  // weak
   CrashReportUploadThread* upload_thread_;  // weak
   const std::map<std::string, std::string>* process_annotations_;  // weak

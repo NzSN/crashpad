@@ -24,6 +24,7 @@
 #include "base/strings/stringprintf.h"
 #include "build/build_config.h"
 #include "minidump/minidump_file_writer.h"
+#include "snapshot/memory_capture_mode.h"
 #include "tools/tool_support.h"
 #include "util/file/file_writer.h"
 #include "util/process/process_id.h"
@@ -61,6 +62,7 @@ void Usage(const base::FilePath& me) {
 "Usage: %" PRFilePath " [OPTION]... PID\n"
 "Generate a minidump file containing a snapshot of a running process.\n"
 "\n"
+"      --dump-mode=MODE partial (default) or full (Windows only)\n"
 "  -r, --no-suspend   don't suspend the target process during dump generation\n"
 "  -o, --output=FILE  write the minidump to FILE instead of minidump.PID\n"
 "      --help         display this help and exit\n"
@@ -82,6 +84,7 @@ int GenerateDumpMain(int argc, char* argv[]) {
 
     // Long options without short equivalents.
     kOptionLastChar = 255,
+    kOptionDumpMode,
 
     // Standard options.
     kOptionHelp = -2,
@@ -89,6 +92,7 @@ int GenerateDumpMain(int argc, char* argv[]) {
   };
 
   struct {
+    MemoryCaptureMode memory_capture_mode = MemoryCaptureMode::kPartial;
     std::string dump_path;
     ProcessID pid;
     bool suspend;
@@ -96,6 +100,7 @@ int GenerateDumpMain(int argc, char* argv[]) {
   options.suspend = true;
 
   static constexpr option long_options[] = {
+      {"dump-mode", required_argument, nullptr, kOptionDumpMode},
       {"no-suspend", no_argument, nullptr, kOptionNoSuspend},
       {"output", required_argument, nullptr, kOptionOutput},
       {"help", no_argument, nullptr, kOptionHelp},
@@ -103,9 +108,28 @@ int GenerateDumpMain(int argc, char* argv[]) {
       {nullptr, 0, nullptr, 0},
   };
 
+  bool dump_mode_seen = false;
   int opt;
   while ((opt = getopt_long(argc, argv, "o:r", long_options, nullptr)) != -1) {
     switch (opt) {
+      case kOptionDumpMode: {
+        if (dump_mode_seen || (std::string(optarg) != "partial" &&
+                               std::string(optarg) != "full")) {
+          ToolSupport::UsageHint(me, "invalid or repeated --dump-mode");
+          return EXIT_FAILURE;
+        }
+        dump_mode_seen = true;
+        options.memory_capture_mode = std::string(optarg) == "full"
+                                          ? MemoryCaptureMode::kFullMemory
+                                          : MemoryCaptureMode::kPartial;
+#if !BUILDFLAG(IS_WIN)
+        if (options.memory_capture_mode == MemoryCaptureMode::kFullMemory) {
+          ToolSupport::UsageHint(me, "--dump-mode=full requires Windows");
+          return EXIT_FAILURE;
+        }
+#endif
+        break;
+      }
       case kOptionOutput:
         options.dump_path = optarg;
         break;
@@ -167,8 +191,8 @@ int GenerateDumpMain(int argc, char* argv[]) {
 #endif  // BUILDFLAG(IS_APPLE)
 
   if (options.dump_path.empty()) {
-    options.dump_path = base::StringPrintf("minidump.%" PRI_PROCESS_ID,
-                                           options.pid);
+    options.dump_path =
+        base::StringPrintf("minidump.%" PRI_PROCESS_ID, options.pid);
   }
 
   {
@@ -196,7 +220,8 @@ int GenerateDumpMain(int argc, char* argv[]) {
                                          ? ProcessSuspensionState::kSuspended
                                          : ProcessSuspensionState::kRunning,
                                      0,
-                                     0)) {
+                                     0,
+                                     options.memory_capture_mode)) {
       return EXIT_FAILURE;
     }
 #elif BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS) || BUILDFLAG(IS_ANDROID)

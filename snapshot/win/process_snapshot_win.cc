@@ -48,15 +48,15 @@ ProcessSnapshotWin::ProcessSnapshotWin()
       options_(),
       initialized_() {}
 
-ProcessSnapshotWin::~ProcessSnapshotWin() {
-}
+ProcessSnapshotWin::~ProcessSnapshotWin() {}
 
-bool ProcessSnapshotWin::Initialize(
-    HANDLE process,
-    ProcessSuspensionState suspension_state,
-    WinVMAddress exception_information_address,
-    WinVMAddress debug_critical_section_address) {
+bool ProcessSnapshotWin::Initialize(HANDLE process,
+                                    ProcessSuspensionState suspension_state,
+                                    WinVMAddress exception_information_address,
+                                    WinVMAddress debug_critical_section_address,
+                                    MemoryCaptureMode memory_capture_mode) {
   INITIALIZATION_STATE_SET_INITIALIZING(initialized_);
+  memory_capture_mode_ = memory_capture_mode;
 
   GetTimeOfDay(&snapshot_time_);
 
@@ -104,6 +104,7 @@ bool ProcessSnapshotWin::Initialize(
 
   InitializeThreads(budget_remaining_pointer);
 
+  size_t full_memory_region_count = 0;
   for (const MEMORY_BASIC_INFORMATION64& mbi :
        process_reader_.GetProcessInfo().MemoryInfo()) {
     memory_map_.push_back(
@@ -113,16 +114,30 @@ bool ProcessSnapshotWin::Initialize(
     // process so that the resulting minidump is a full memory dump. This is
     // the same accessibility predicate as RegionIsAccessible() in
     // util/win/process_info.cc.
-    if (mbi.State == MEM_COMMIT && (mbi.Protect & PAGE_NOACCESS) == 0 &&
-        (mbi.Protect & PAGE_GUARD) == 0) {
+    if (memory_capture_mode_ == MemoryCaptureMode::kFullMemory &&
+        mbi.RegionSize != 0 && mbi.State == MEM_COMMIT &&
+        (mbi.Protect & PAGE_NOACCESS) == 0 && (mbi.Protect & PAGE_GUARD) == 0) {
+      if (!CheckedRange<WinVMAddress, WinVMSize>(
+               static_cast<WinVMAddress>(mbi.BaseAddress),
+               static_cast<WinVMSize>(mbi.RegionSize))
+               .IsValid()) {
+        LOG(ERROR) << "Full-memory region address overflow";
+        return false;
+      }
       auto memory_snapshot =
           std::make_unique<internal::MemorySnapshotGeneric>();
-      memory_snapshot->Initialize(
-          process_reader_.Memory(),
-          static_cast<WinVMAddress>(mbi.BaseAddress),
-          static_cast<WinVMSize>(mbi.RegionSize));
+      memory_snapshot->Initialize(process_reader_.Memory(),
+                                  static_cast<WinVMAddress>(mbi.BaseAddress),
+                                  static_cast<WinVMSize>(mbi.RegionSize));
       extra_memory_.push_back(std::move(memory_snapshot));
+      ++full_memory_region_count;
     }
+  }
+
+  if (memory_capture_mode_ == MemoryCaptureMode::kFullMemory &&
+      full_memory_region_count == 0) {
+    LOG(ERROR) << "Full-memory capture found no eligible process regions";
+    return false;
   }
 
   for (const auto& module : modules_) {
@@ -133,6 +148,11 @@ bool ProcessSnapshotWin::Initialize(
 
   INITIALIZATION_STATE_SET_VALID(initialized_);
   return true;
+}
+
+MemoryCaptureMode ProcessSnapshotWin::GetMemoryCaptureMode() const {
+  INITIALIZATION_STATE_DCHECK_VALID(initialized_);
+  return memory_capture_mode_;
 }
 
 void ProcessSnapshotWin::GetCrashpadOptions(

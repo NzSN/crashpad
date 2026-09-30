@@ -70,9 +70,7 @@ class TestStream final : public internal::MinidumpStreamWriter {
   ~TestStream() override {}
 
   // MinidumpStreamWriter:
-  MinidumpStreamType StreamType() const override {
-    return stream_type_;
-  }
+  MinidumpStreamType StreamType() const override { return stream_type_; }
 
  protected:
   // MinidumpWritable:
@@ -382,54 +380,28 @@ TEST(MinidumpFileWriter, InitializeFromSnapshot_Basic) {
   const MINIDUMP_DIRECTORY* directory;
   const MINIDUMP_HEADER* header =
       MinidumpHeaderAtStart(string_file.string(), &directory);
-#if BUILDFLAG(IS_WIN)
-  // On Windows, extra memory is carried by a Memory64ListStream, the
-  // MemoryListStream is omitted (dbgeng rejects full-memory minidumps that
-  // also carry a MemoryListStream), and the minidump is marked as a
-  // full-memory dump.
-  ASSERT_NO_FATAL_FAILURE(VerifyMinidumpHeader(
-      header, 5, kSnapshotTime, MiniDumpWithFullMemory));
-#else
   ASSERT_NO_FATAL_FAILURE(VerifyMinidumpHeader(header, 5, kSnapshotTime));
-#endif
   ASSERT_TRUE(directory);
 
   EXPECT_EQ(directory[0].StreamType, kMinidumpStreamTypeSystemInfo);
   EXPECT_TRUE(MinidumpWritableAtLocationDescriptor<MINIDUMP_SYSTEM_INFO>(
-                  string_file.string(), directory[0].Location));
+      string_file.string(), directory[0].Location));
 
   EXPECT_EQ(directory[1].StreamType, kMinidumpStreamTypeMiscInfo);
   EXPECT_TRUE(MinidumpWritableAtLocationDescriptor<MINIDUMP_MISC_INFO_4>(
-                  string_file.string(), directory[1].Location));
+      string_file.string(), directory[1].Location));
 
   EXPECT_EQ(directory[2].StreamType, kMinidumpStreamTypeThreadList);
   EXPECT_TRUE(MinidumpWritableAtLocationDescriptor<MINIDUMP_THREAD_LIST>(
-                  string_file.string(), directory[2].Location));
+      string_file.string(), directory[2].Location));
 
   EXPECT_EQ(directory[3].StreamType, kMinidumpStreamTypeModuleList);
   EXPECT_TRUE(MinidumpWritableAtLocationDescriptor<MINIDUMP_MODULE_LIST>(
-                  string_file.string(), directory[3].Location));
+      string_file.string(), directory[3].Location));
 
-#if BUILDFLAG(IS_WIN)
-  EXPECT_EQ(directory[4].StreamType, kMinidumpStreamTypeMemory64List);
-  const MINIDUMP_MEMORY64_LIST* memory64_list =
-      MinidumpWritableAtLocationDescriptor<MINIDUMP_MEMORY64_LIST>(
-          string_file.string(), directory[4].Location);
-  ASSERT_TRUE(memory64_list);
-  ASSERT_EQ(memory64_list->NumberOfMemoryRanges, 1u);
-  EXPECT_EQ(memory64_list->MemoryRanges[0].StartOfMemoryRange, kPebAddress);
-  EXPECT_EQ(memory64_list->MemoryRanges[0].DataSize, kPebSize);
-
-  // The memory range contents follow the descriptor array, at BaseRva.
-  ASSERT_GE(string_file.string().size(),
-            memory64_list->BaseRva + kPebSize);
-  EXPECT_EQ(
-      string_file.string().substr(memory64_list->BaseRva, kPebSize),
-      std::string(kPebSize, 'p'));
-#else
   EXPECT_EQ(directory[4].StreamType, kMinidumpStreamTypeMemoryList);
   EXPECT_TRUE(MinidumpWritableAtLocationDescriptor<MINIDUMP_MEMORY_LIST>(
-                  string_file.string(), directory[4].Location));
+      string_file.string(), directory[4].Location));
 
   const MINIDUMP_MEMORY_LIST* memory_list =
       MinidumpWritableAtLocationDescriptor<MINIDUMP_MEMORY_LIST>(
@@ -437,8 +409,64 @@ TEST(MinidumpFileWriter, InitializeFromSnapshot_Basic) {
   EXPECT_EQ(memory_list->NumberOfMemoryRanges, 1u);
   EXPECT_EQ(memory_list->MemoryRanges[0].StartOfMemoryRange, kPebAddress);
   EXPECT_EQ(memory_list->MemoryRanges[0].Memory.DataSize, kPebSize);
-#endif
 }
+
+#if BUILDFLAG(IS_WIN)
+TEST(MinidumpFileWriter, InitializeFromSnapshot_MemoryCaptureModes) {
+  for (MemoryCaptureMode mode :
+       {MemoryCaptureMode::kPartial, MemoryCaptureMode::kFullMemory}) {
+    for (bool with_memory : {false, true}) {
+      TestProcessSnapshot snapshot;
+      snapshot.SetMemoryCaptureMode(mode);
+      auto system = std::make_unique<TestSystemSnapshot>();
+      system->SetCPUArchitecture(kCPUArchitectureX86_64);
+      system->SetOperatingSystem(SystemSnapshot::kOperatingSystemWindows);
+      snapshot.SetSystem(std::move(system));
+      if (with_memory) {
+        auto memory = std::make_unique<TestMemorySnapshot>();
+        memory->SetAddress(0x100000);
+        memory->SetSize(513);
+        memory->SetValue('x');
+        snapshot.AddExtraMemory(std::move(memory));
+      }
+      MinidumpFileWriter writer;
+      writer.InitializeFromSnapshot(&snapshot);
+      StringFile file;
+      ASSERT_TRUE(writer.WriteEverything(&file));
+      const MINIDUMP_DIRECTORY* directory;
+      const MINIDUMP_HEADER* header =
+          MinidumpHeaderAtStart(file.string(), &directory);
+      ASSERT_TRUE(header);
+      const bool full = mode == MemoryCaptureMode::kFullMemory;
+      EXPECT_EQ((header->Flags & MiniDumpWithFullMemory) != 0, full);
+      size_t selected = 0;
+      for (uint32_t i = 0; i < header->NumberOfStreams; ++i) {
+        EXPECT_NE(directory[i].StreamType,
+                  full ? kMinidumpStreamTypeMemoryList
+                       : kMinidumpStreamTypeMemory64List);
+        if (directory[i].StreamType == (full ? kMinidumpStreamTypeMemory64List
+                                             : kMinidumpStreamTypeMemoryList)) {
+          ++selected;
+          if (full) {
+            const auto* memory =
+                MinidumpWritableAtLocationDescriptor<MINIDUMP_MEMORY64_LIST>(
+                    file.string(), directory[i].Location);
+            ASSERT_TRUE(memory);
+            EXPECT_EQ(memory->NumberOfMemoryRanges, with_memory ? 1u : 0u);
+            if (with_memory) {
+              EXPECT_EQ(memory->MemoryRanges[0].StartOfMemoryRange, 0x100000u);
+              EXPECT_EQ(memory->MemoryRanges[0].DataSize, 513u);
+              EXPECT_EQ(file.string().substr(memory->BaseRva, 513),
+                        std::string(513, 'x'));
+            }
+          }
+        }
+      }
+      EXPECT_EQ(selected, 1u);
+    }
+  }
+}
+#endif  // BUILDFLAG(IS_WIN)
 
 TEST(MinidumpFileWriter, InitializeFromSnapshot_Exception) {
   // In a 32-bit environment, this will give a “timestamp out of range” warning,
@@ -446,12 +474,11 @@ TEST(MinidumpFileWriter, InitializeFromSnapshot_Exception) {
   constexpr uint32_t kSnapshotTime = 0xfd469ab8;
   constexpr timeval kSnapshotTimeval = {
 #if BUILDFLAG(IS_WIN)
-    static_cast<long>(kSnapshotTime),
+      static_cast<long>(kSnapshotTime),
 #else
-    static_cast<time_t>(kSnapshotTime),
+      static_cast<time_t>(kSnapshotTime),
 #endif
-    0
-  };
+      0};
 
   TestProcessSnapshot process_snapshot;
   process_snapshot.SetSnapshotTime(kSnapshotTimeval);
@@ -490,27 +517,27 @@ TEST(MinidumpFileWriter, InitializeFromSnapshot_Exception) {
 
   EXPECT_EQ(directory[0].StreamType, kMinidumpStreamTypeSystemInfo);
   EXPECT_TRUE(MinidumpWritableAtLocationDescriptor<MINIDUMP_SYSTEM_INFO>(
-                  string_file.string(), directory[0].Location));
+      string_file.string(), directory[0].Location));
 
   EXPECT_EQ(directory[1].StreamType, kMinidumpStreamTypeMiscInfo);
   EXPECT_TRUE(MinidumpWritableAtLocationDescriptor<MINIDUMP_MISC_INFO_4>(
-                  string_file.string(), directory[1].Location));
+      string_file.string(), directory[1].Location));
 
   EXPECT_EQ(directory[2].StreamType, kMinidumpStreamTypeThreadList);
   EXPECT_TRUE(MinidumpWritableAtLocationDescriptor<MINIDUMP_THREAD_LIST>(
-                  string_file.string(), directory[2].Location));
+      string_file.string(), directory[2].Location));
 
   EXPECT_EQ(directory[3].StreamType, kMinidumpStreamTypeException);
   EXPECT_TRUE(MinidumpWritableAtLocationDescriptor<MINIDUMP_EXCEPTION_STREAM>(
-                  string_file.string(), directory[3].Location));
+      string_file.string(), directory[3].Location));
 
   EXPECT_EQ(directory[4].StreamType, kMinidumpStreamTypeModuleList);
   EXPECT_TRUE(MinidumpWritableAtLocationDescriptor<MINIDUMP_MODULE_LIST>(
-                  string_file.string(), directory[4].Location));
+      string_file.string(), directory[4].Location));
 
   EXPECT_EQ(directory[5].StreamType, kMinidumpStreamTypeMemoryList);
   EXPECT_TRUE(MinidumpWritableAtLocationDescriptor<MINIDUMP_MEMORY_LIST>(
-                  string_file.string(), directory[5].Location));
+      string_file.string(), directory[5].Location));
 }
 
 TEST(MinidumpFileWriter, InitializeFromSnapshot_CrashpadInfo) {
@@ -554,31 +581,31 @@ TEST(MinidumpFileWriter, InitializeFromSnapshot_CrashpadInfo) {
 
   EXPECT_EQ(directory[0].StreamType, kMinidumpStreamTypeSystemInfo);
   EXPECT_TRUE(MinidumpWritableAtLocationDescriptor<MINIDUMP_SYSTEM_INFO>(
-                  string_file.string(), directory[0].Location));
+      string_file.string(), directory[0].Location));
 
   EXPECT_EQ(directory[1].StreamType, kMinidumpStreamTypeMiscInfo);
   EXPECT_TRUE(MinidumpWritableAtLocationDescriptor<MINIDUMP_MISC_INFO_4>(
-                  string_file.string(), directory[1].Location));
+      string_file.string(), directory[1].Location));
 
   EXPECT_EQ(directory[2].StreamType, kMinidumpStreamTypeThreadList);
   EXPECT_TRUE(MinidumpWritableAtLocationDescriptor<MINIDUMP_THREAD_LIST>(
-                  string_file.string(), directory[2].Location));
+      string_file.string(), directory[2].Location));
 
   EXPECT_EQ(directory[3].StreamType, kMinidumpStreamTypeException);
   EXPECT_TRUE(MinidumpWritableAtLocationDescriptor<MINIDUMP_EXCEPTION_STREAM>(
-                  string_file.string(), directory[3].Location));
+      string_file.string(), directory[3].Location));
 
   EXPECT_EQ(directory[4].StreamType, kMinidumpStreamTypeModuleList);
   EXPECT_TRUE(MinidumpWritableAtLocationDescriptor<MINIDUMP_MODULE_LIST>(
-                  string_file.string(), directory[4].Location));
+      string_file.string(), directory[4].Location));
 
   EXPECT_EQ(directory[5].StreamType, kMinidumpStreamTypeCrashpadInfo);
   EXPECT_TRUE(MinidumpWritableAtLocationDescriptor<MinidumpCrashpadInfo>(
-                  string_file.string(), directory[5].Location));
+      string_file.string(), directory[5].Location));
 
   EXPECT_EQ(directory[6].StreamType, kMinidumpStreamTypeMemoryList);
   EXPECT_TRUE(MinidumpWritableAtLocationDescriptor<MINIDUMP_MEMORY_LIST>(
-                  string_file.string(), directory[6].Location));
+      string_file.string(), directory[6].Location));
 }
 
 TEST(MinidumpFileWriter, SameStreamType) {
