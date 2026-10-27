@@ -22,6 +22,7 @@
 #include <cstring>
 #include <optional>
 #include <string>
+#include <sstream>
 #include <utility>
 
 #include "base/logging.h"
@@ -347,45 +348,70 @@ void V8HeapCapture::MaybeRecordExternalString(uint64_t name_va) {
   if ((*itype & v8_layout::kStringExternalBit) == 0)
     return;  // inline string — no EPT needed
   const auto handle = ReadRegionsU32(name_va + v8_layout::kStringChars);
+  const auto data_handle = ReadRegionsU32(name_va + 16).value_or(0);
   const auto len = ReadRegionsU32(name_va + v8_layout::kStringLength);
   if (!handle || *handle == 0 || !len || *len == 0 ||
       *len > v8_layout::kMaxNameLen) {
     return;
   }
   external_strings_.push_back(
-      {*handle, *len, (*itype & v8_layout::kStringOneByteBit) != 0});
+      {*handle, *len, data_handle, (*itype & v8_layout::kStringOneByteBit) != 0});
 }
 
 void V8HeapCapture::CaptureExternalStrings(const ProcessMemory& memory) {
   if (external_strings_.empty())
     return;
 
-  // Gather the captured isolate slice bytes for EPT-base scanning.
-  std::vector<uint8_t> isolate;
-  const uint64_t iso_start = AlignDownToPage(isolate_va_);
-  for (uint64_t va = iso_start; va < iso_start + kIsolateSliceSpan;
-       va += kV8PageSize) {
-    const auto it = regions_.find(va);
-    if (it != regions_.end()) {
-      isolate.insert(isolate.end(), it->second.bytes.begin(),
-                     it->second.bytes.end());
-    } else {
-      isolate.insert(isolate.end(), kV8PageSize, 0);  // gap (best-effort)
+  // V8 15.2 exposes the table directly through Isolate.shared_external_pointer_table_
+  // at +0x300. Prefer that authoritative route; older layouts retain the
+  // validated isolate-scan fallback.
+  const auto shared_table = ReadMemU64(memory, isolate_va_ + 0x300);
+  if (shared_table)
+    CaptureBytes(memory, *shared_table, 64);
+  uint64_t ept_base = shared_table
+      ? ReadMemU64(memory, *shared_table).value_or(0) : 0;
+  if (ept_base == 0) {
+    std::vector<uint8_t> isolate;
+    const uint64_t iso_start = AlignDownToPage(isolate_va_);
+    for (uint64_t va = iso_start; va < iso_start + kIsolateSliceSpan;
+         va += kV8PageSize) {
+      const auto it = regions_.find(va);
+      if (it != regions_.end()) {
+        isolate.insert(isolate.end(), it->second.bytes.begin(),
+                       it->second.bytes.end());
+      } else {
+        isolate.insert(isolate.end(), kV8PageSize, 0);
+      }
     }
+
+    const ExternalString& seed = external_strings_.front();
+    ept_base = FindEptBase(memory, isolate.data(), isolate.size(), seed.handle,
+                           seed.len, seed.one_byte, module_ranges_);
   }
-
-  const ExternalString& seed = external_strings_.front();
-  const uint64_t ept_base =
-      FindEptBase(memory, isolate.data(), isolate.size(), seed.handle,
-                  seed.len, seed.one_byte, module_ranges_);
   if (ept_base == 0)
-    return;  // can't locate the table — external names degrade to None
+    return;
 
-  // Capture the EPT reservation so the decoder can read any entry.
   CaptureRange(memory, ept_base, kEptReservationCap);
 
-  // Capture each external string's resource object + char buffer.
   for (const ExternalString& es : external_strings_) {
+    const uint64_t char_len =
+        es.one_byte ? es.len : static_cast<uint64_t>(es.len) * 2;
+    const uint64_t bounded_len =
+        std::min(char_len, static_cast<uint64_t>(v8_layout::kMaxNameLen));
+
+    // Cached external strings have a direct resource_data handle to the char
+    // buffer. Capture it independently of the resource/vtable heuristic.
+    if (es.data_handle != 0) {
+      const uint64_t idx = es.data_handle >> v8_layout::kEptIndexShift;
+      const auto entry = ReadMemU64(
+          memory, ept_base + v8_layout::kEptEntrySize * idx);
+      if (entry) {
+        const uint64_t chars = *entry & v8_layout::kEptPayloadMask;
+        if (chars != 0)
+          CaptureBytes(memory, chars, bounded_len);
+      }
+    }
+
     const uint64_t idx = es.handle >> v8_layout::kEptIndexShift;
     const auto entry =
         ReadMemU64(memory, ept_base + v8_layout::kEptEntrySize * idx);
@@ -394,14 +420,11 @@ void V8HeapCapture::CaptureExternalStrings(const ProcessMemory& memory) {
     const uint64_t resource = *entry & v8_layout::kEptPayloadMask;
     if (resource == 0)
       continue;
-    CaptureBytes(memory, resource, 64);  // vtable (+0) + chars pointer (+16)
-    const auto chars = ReadMemU64(memory, resource + 16);
-    if (!chars)
-      continue;
-    const uint64_t char_len =
-        es.one_byte ? es.len : static_cast<uint64_t>(es.len) * 2;
-    CaptureBytes(memory, *chars,
-                 std::min(char_len, static_cast<uint64_t>(v8_layout::kMaxNameLen)));
+    CaptureBytes(memory, resource, 64);
+    const auto chars = ReadMemU64(
+        memory, resource + v8_layout::kExternalResourceCachedDataOffset);
+    if (es.data_handle == 0 && chars)
+      CaptureBytes(memory, *chars, bounded_len);
   }
 }
 
@@ -459,7 +482,7 @@ uint64_t V8HeapCapture::FindEptBase(
       const auto vtable = ReadMemU64(memory, resource);
       if (!vtable || !in_module(*vtable))
         continue;  // resource's vtable must be inside a loaded module
-      const auto chars = ReadMemU64(memory, resource + 16);
+      const auto chars = ReadMemU64(memory, resource + v8_layout::kExternalResourceCachedDataOffset);
       if (!chars)
         continue;
       if (IsPrintableChars(memory, *chars, len, one_byte))

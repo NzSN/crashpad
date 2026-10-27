@@ -155,6 +155,7 @@ class V8HeapCapture {
   struct ExternalString {
     uint32_t handle;
     uint32_t len;
+    uint32_t data_handle;
     bool one_byte;
   };
   std::vector<ExternalString> external_strings_;

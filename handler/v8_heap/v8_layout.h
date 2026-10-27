@@ -20,8 +20,8 @@
 namespace crashpad {
 namespace v8_layout {
 
-// V8 14.6 (Chromium 146 / Electron 41) layout constants. Mirrors
-// forensicator-core's v8layout.rs `v14_6()`. Only the offsets the collector
+// V8 15.2 (Chromium 152 / Electron 44) layout constants. Mirrors
+// forensicator-core's v8layout.rs `v15_2()`. Only the offsets the collector
 // needs to chase the decoder's name/line chain are pinned here; everything
 // else is captured raw and decoded out-of-process by the analyzer.
 
@@ -52,9 +52,10 @@ inline constexpr uint16_t kStringExternalBit = 0x02;
 inline constexpr uint32_t kMaxNameLen = 4096;
 
 // ── External pointer table (sandbox EPT) ──
-inline constexpr uint64_t kEptEntrySize = 16;
+inline constexpr uint64_t kEptEntrySize = 8;
 inline constexpr uint32_t kEptIndexShift = 6;
-inline constexpr uint64_t kEptPayloadMask = 0x0000FFFFFFFFFFFFULL;
+inline constexpr uint64_t kEptPayloadMask = 0xff00ffffffffffffULL;
+inline constexpr uint64_t kExternalResourceCachedDataOffset = 8;
 
 }  // namespace v8_layout
 }  // namespace crashpad
