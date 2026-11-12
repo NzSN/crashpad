@@ -20,6 +20,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -64,6 +65,10 @@ inline uint64_t ReadU64LE(const uint8_t* p) {
   uint64_t v;
   std::memcpy(&v, p, sizeof(v));
   return v;
+}
+
+bool AddWouldOverflow(uint64_t base, uint64_t size) {
+  return size > std::numeric_limits<uint64_t>::max() - base;
 }
 
 void AppendU32(std::vector<uint8_t>& out, uint32_t v) {
@@ -181,7 +186,7 @@ void V8HeapCapture::Capture(const ProcessSnapshot& snapshot) {
 void V8HeapCapture::CaptureRange(const ProcessMemory& memory,
                                  uint64_t va,
                                  uint64_t size) {
-  if (size == 0)
+  if (size == 0 || AddWouldOverflow(va, size))
     return;
   // Read in 4 KiB sub-chunks and coalesce contiguous readable chunks into a
   // single region. A committed region may be smaller than a V8 page (RO space
@@ -194,7 +199,7 @@ void V8HeapCapture::CaptureRange(const ProcessMemory& memory,
   const uint64_t end = va + size;
   uint64_t run_start = 0;
   std::vector<uint8_t> run;
-  for (uint64_t a = start; a < end; a += kSubChunk) {
+  for (uint64_t a = start; a < end;) {
     std::vector<uint8_t> buf(kSubChunk);
     if (memory.Read(a, kSubChunk, buf.data())) {
       if (run.empty())
@@ -208,6 +213,9 @@ void V8HeapCapture::CaptureRange(const ProcessMemory& memory,
           break;
       }
     }
+    if (AddWouldOverflow(a, kSubChunk))
+      break;
+    a += kSubChunk;
   }
   if (!run.empty())
     AddPage(run_start, std::move(run));
@@ -303,9 +311,13 @@ const uint8_t* V8HeapCapture::ReadRegions(uint64_t va, size_t len) const {
   --it;
   const auto& bytes = it->second.bytes;
   const uint64_t start = it->first;
-  if (va < start || va - start + len > bytes.size())
+  if (va < start)
     return nullptr;
-  return bytes.data() + (va - start);
+  const uint64_t offset = va - start;
+  if (offset > bytes.size() ||
+      static_cast<uint64_t>(len) > bytes.size() - offset)
+    return nullptr;
+  return bytes.data() + static_cast<size_t>(offset);
 }
 
 std::optional<uint32_t> V8HeapCapture::ReadRegionsU32(uint64_t va) const {
@@ -342,73 +354,136 @@ void V8HeapCapture::MaybeRecordExternalString(uint64_t name_va) {
     return;
   const uint64_t map = cage_base_ + (*map_c & ~1u);
   const auto itype = ReadRegionsU16(map + v8_layout::kMapInstanceTypeOffset);
-  if (!itype || *itype >= v8_layout::kStringITypeMax)
+  if (!itype || *itype >= v8_layout::kFirstNonStringType)
     return;
-  if ((*itype & v8_layout::kStringExternalBit) == 0)
-    return;  // inline string — no EPT needed
+  // Representation is a 3-bit value. Sliced strings (tag 3) share bit 1 with
+  // external strings (tag 2); compare the field, do not test the bit.
+  if ((*itype & v8_layout::kStringRepresentationMask) !=
+      v8_layout::kExternalStringTag) {
+    return;
+  }
   const auto handle = ReadRegionsU32(name_va + v8_layout::kStringChars);
+  // Uncached external strings end after resource_. The following word belongs
+  // to the next object, not to resource_data_.
+  const bool uncached =
+      (*itype & v8_layout::kStringUncachedExternalBit) != 0;
+  const uint32_t data_handle =
+      uncached ? 0
+               : ReadRegionsU32(name_va + v8_layout::kStringResourceData)
+                     .value_or(0);
   const auto len = ReadRegionsU32(name_va + v8_layout::kStringLength);
   if (!handle || *handle == 0 || !len || *len == 0 ||
       *len > v8_layout::kMaxNameLen) {
     return;
   }
-  external_strings_.push_back(
-      {*handle, *len, (*itype & v8_layout::kStringOneByteBit) != 0});
+  external_strings_.push_back({*handle,
+                               *len,
+                               data_handle,
+                               (*itype & v8_layout::kStringOneByteBit) != 0});
 }
 
 void V8HeapCapture::CaptureExternalStrings(const ProcessMemory& memory) {
   if (external_strings_.empty())
     return;
 
-  // Gather the captured isolate slice bytes for EPT-base scanning.
-  std::vector<uint8_t> isolate;
-  const uint64_t iso_start = AlignDownToPage(isolate_va_);
-  for (uint64_t va = iso_start; va < iso_start + kIsolateSliceSpan;
-       va += kV8PageSize) {
-    const auto it = regions_.find(va);
-    if (it != regions_.end()) {
-      isolate.insert(isolate.end(), it->second.bytes.begin(),
-                     it->second.bytes.end());
-    } else {
-      isolate.insert(isolate.end(), kV8PageSize, 0);  // gap (best-effort)
+  // The pinned build stores ExternalPointerTable* at a fixed IsolateData
+  // slot. There is no runtime V8 version key, so a value at that slot is
+  // used only when an entry has the expected tag and its payload is readable
+  // for the recorded length. Anything else falls back to the scan.
+  uint64_t ept_base = 0;
+  std::optional<uint64_t> shared_table;
+  if (!AddWouldOverflow(isolate_va_,
+                        v8_layout::kIsolateSharedExternalPointerTableOffset)) {
+    shared_table = ReadMemU64(
+        memory,
+        isolate_va_ + v8_layout::kIsolateSharedExternalPointerTableOffset);
+    if (shared_table && *shared_table != 0 &&
+        !AddWouldOverflow(*shared_table, 8)) {
+      ept_base = ReadMemU64(memory, *shared_table).value_or(0);
     }
   }
-
-  const ExternalString& seed = external_strings_.front();
-  const uint64_t ept_base =
-      FindEptBase(memory, isolate.data(), isolate.size(), seed.handle,
-                  seed.len, seed.one_byte, module_ranges_);
+  bool valid_base = false;
+  for (const ExternalString& es : external_strings_) {
+    const auto resource =
+        ReadEptPointer(memory, ept_base, es.handle, v8_layout::kEptResourceTag);
+    // resource+8 holds cached_data_; the following load reads 8 bytes.
+    if (!resource || AddWouldOverflow(*resource, 16))
+      continue;
+    const size_t bytes =
+        es.one_byte ? es.len : static_cast<size_t>(es.len) * 2;
+    std::vector<uint8_t> probe(bytes);
+    const auto readable = [&](std::optional<uint64_t> chars) {
+      return chars && *chars != 0 && !AddWouldOverflow(*chars, bytes) &&
+             memory.Read(*chars, bytes, probe.data());
+    };
+    if (readable(ReadEptPointer(memory,
+                                ept_base,
+                                es.data_handle,
+                                v8_layout::kEptResourceDataTag)) ||
+        readable(ReadMemU64(
+            memory, *resource + v8_layout::kExternalResourceCachedDataOffset))) {
+      valid_base = true;
+      break;
+    }
+  }
+  if (valid_base && shared_table) {
+    // Keep the table object so a decoder can repeat the two-word load.
+    CaptureBytes(memory, *shared_table, 64);
+  } else {
+    // Preserve gaps and the unaligned isolate origin. CaptureRange coalesces
+    // 4 KiB chunks, which need not start on a 256 KiB V8 page.
+    std::vector<uint8_t> isolate(kIsolateSliceSpan, 0);
+    for (size_t off = 0; off + 8 <= isolate.size(); off += 8) {
+      if (AddWouldOverflow(isolate_va_, off))
+        break;
+      const uint8_t* bytes = ReadRegions(isolate_va_ + off, 8);
+      if (bytes)
+        std::memcpy(isolate.data() + off, bytes, 8);
+    }
+    const ExternalString& seed = external_strings_.front();
+    ept_base = FindEptBase(memory,
+                           isolate.data(),
+                           isolate.size(),
+                           seed.handle,
+                           seed.len,
+                           seed.one_byte,
+                           module_ranges_);
+  }
   if (ept_base == 0)
-    return;  // can't locate the table — external names degrade to None
+    return;
 
-  // Capture the EPT reservation so the decoder can read any entry.
   CaptureRange(memory, ept_base, kEptReservationCap);
 
-  // Capture each external string's resource object + char buffer.
   for (const ExternalString& es : external_strings_) {
-    const uint64_t idx = es.handle >> v8_layout::kEptIndexShift;
-    const auto entry =
-        ReadMemU64(memory, ept_base + v8_layout::kEptEntrySize * idx);
-    if (!entry)
-      continue;
-    const uint64_t resource = *entry & v8_layout::kEptPayloadMask;
-    if (resource == 0)
-      continue;
-    CaptureBytes(memory, resource, 64);  // vtable (+0) + chars pointer (+16)
-    const auto chars = ReadMemU64(memory, resource + 16);
-    if (!chars)
-      continue;
-    const uint64_t char_len =
+    // Character length is already <= kMaxNameLen. Two-byte payloads are
+    // twice that many bytes; do not truncate them to the character cap.
+    const uint64_t byte_len =
         es.one_byte ? es.len : static_cast<uint64_t>(es.len) * 2;
-    CaptureBytes(memory, *chars,
-                 std::min(char_len, static_cast<uint64_t>(v8_layout::kMaxNameLen)));
+
+    bool captured_chars = false;
+    const auto data = ReadEptPointer(
+        memory, ept_base, es.data_handle, v8_layout::kEptResourceDataTag);
+    if (data)
+      captured_chars = CaptureBytes(memory, *data, byte_len);
+
+    const auto resource =
+        ReadEptPointer(memory, ept_base, es.handle, v8_layout::kEptResourceTag);
+    if (!resource || AddWouldOverflow(*resource, 16))
+      continue;
+    CaptureBytes(memory, *resource, 64);
+    if (captured_chars)
+      continue;
+    const auto chars = ReadMemU64(
+        memory, *resource + v8_layout::kExternalResourceCachedDataOffset);
+    if (chars && *chars != 0)
+      CaptureBytes(memory, *chars, byte_len);
   }
 }
 
 bool V8HeapCapture::CaptureBytes(const ProcessMemory& memory,
                                  uint64_t va,
                                  uint64_t size) {
-  if (size == 0)
+  if (size == 0 || AddWouldOverflow(va, size))
     return false;
   if (regions_.count(va))
     return true;
@@ -429,9 +504,10 @@ uint64_t V8HeapCapture::FindEptBase(
     uint32_t len,
     bool one_byte,
     const std::vector<std::pair<uint64_t, uint64_t>>& module_ranges) {
-  const uint64_t idx = handle >> v8_layout::kEptIndexShift;
   const auto in_module = [&module_ranges](uint64_t va) {
     for (const auto& [base, size] : module_ranges) {
+      if (AddWouldOverflow(base, size))
+        continue;
       if (va >= base && va < base + size)
         return true;
     }
@@ -439,27 +515,28 @@ uint64_t V8HeapCapture::FindEptBase(
   };
   // Pass 1 rejects payloads inside the candidate table's own window; pass 2
   // accepts any validated payload. Mirrors forensicator find_ept_base.
+  constexpr uint64_t kCandidateWindow = 2ULL << 20;
   for (const bool reject_internal : {true, false}) {
     for (size_t off = 0; off + 8 <= isolate_size; off += 8) {
       uint64_t b;
       std::memcpy(&b, isolate + off, 8);
-      if (b < 0x10000 || (b & 7) != 0)
+      const auto pointer =
+          ReadEptPointer(memory, b, handle, v8_layout::kEptResourceTag);
+      if (!pointer || AddWouldOverflow(*pointer, 16))
         continue;
-      const auto entry =
-          ReadMemU64(memory, b + v8_layout::kEptEntrySize * idx);
-      if (!entry)
+      const uint64_t resource = *pointer;
+      if (reject_internal &&
+          (AddWouldOverflow(b, kCandidateWindow) ||
+           (resource >= b && resource < b + kCandidateWindow))) {
         continue;
-      const uint64_t resource = *entry & v8_layout::kEptPayloadMask;
-      if (resource == 0)
-        continue;
-      if (reject_internal && resource >= b && resource < b + (2 << 20))
-        continue;
+      }
       if (in_module(resource))
         continue;  // resource must be a heap object, not module code
       const auto vtable = ReadMemU64(memory, resource);
       if (!vtable || !in_module(*vtable))
         continue;  // resource's vtable must be inside a loaded module
-      const auto chars = ReadMemU64(memory, resource + 16);
+      const auto chars = ReadMemU64(
+          memory, resource + v8_layout::kExternalResourceCachedDataOffset);
       if (!chars)
         continue;
       if (IsPrintableChars(memory, *chars, len, one_byte))
@@ -467,6 +544,30 @@ uint64_t V8HeapCapture::FindEptBase(
     }
   }
   return 0;
+}
+
+std::optional<uint64_t> V8HeapCapture::ReadEptPointer(
+    const ProcessMemory& memory,
+    uint64_t base,
+    uint32_t handle,
+    uint64_t tag) {
+  const uint32_t handle_mask = (1u << v8_layout::kEptIndexShift) - 1;
+  if (base < 0x10000 || (base & 7) != 0 || handle == 0 ||
+      (handle & handle_mask) != 0) {
+    return std::nullopt;
+  }
+  const uint64_t offset =
+      v8_layout::kEptEntrySize * (handle >> v8_layout::kEptIndexShift);
+  // A shifted handle addresses one 8-byte entry inside the 512 MB reservation.
+  if (offset > v8_layout::kEptReservationSize - 8 ||
+      AddWouldOverflow(base, offset + 8)) {
+    return std::nullopt;
+  }
+  const auto entry = ReadMemU64(memory, base + offset);
+  if (!entry || (*entry & v8_layout::kEptTagMask) != tag)
+    return std::nullopt;
+  const uint64_t pointer = *entry & v8_layout::kEptPayloadMask;
+  return pointer != 0 ? std::optional<uint64_t>(pointer) : std::nullopt;
 }
 
 std::optional<uint64_t> V8HeapCapture::ReadMemU64(const ProcessMemory& memory,
@@ -483,9 +584,11 @@ bool V8HeapCapture::IsPrintableChars(const ProcessMemory& memory,
                                      uint64_t chars,
                                      uint32_t len,
                                      bool one_byte) {
-  if (len == 0 || len > v8_layout::kMaxNameLen)
+  if (len == 0 || len > v8_layout::kMaxNameLen || chars == 0)
     return false;
   const size_t bytes = one_byte ? len : static_cast<size_t>(len) * 2;
+  if (AddWouldOverflow(chars, bytes))
+    return false;
   std::vector<uint8_t> buf(bytes);
   if (!memory.Read(chars, bytes, buf.data()))
     return false;

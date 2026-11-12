@@ -135,6 +135,13 @@ class V8HeapCapture {
   // targets are not page-aligned). Returns true if the region is present.
   bool CaptureBytes(const ProcessMemory& memory, uint64_t va, uint64_t size);
 
+  // Decode one V8 15.6 external-pointer entry. Fails closed on a short,
+  // unaligned, or out-of-reservation handle, on address overflow, and when
+  // the entry tag is not exactly |tag|. The mark bit is ignored.
+  static std::optional<uint64_t> ReadEptPointer(const ProcessMemory& memory,
+                                                uint64_t base,
+                                                uint32_t handle,
+                                                uint64_t tag);
   static std::optional<uint64_t> ReadMemU64(const ProcessMemory& memory,
                                             uint64_t va);
   static bool IsPrintableChars(const ProcessMemory& memory,
@@ -155,6 +162,7 @@ class V8HeapCapture {
   struct ExternalString {
     uint32_t handle;
     uint32_t len;
+    uint32_t data_handle;
     bool one_byte;
   };
   std::vector<ExternalString> external_strings_;
